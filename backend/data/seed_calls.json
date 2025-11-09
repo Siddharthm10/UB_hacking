@@ -1,0 +1,69 @@
+{
+  "agents": [
+    {
+      "agentId": "agent-1001",
+      "name": "Avery Quinn",
+      "team": "Retention"
+    },
+    {
+      "agentId": "agent-2002",
+      "name": "Jordan Ellis",
+      "team": "Collections"
+    }
+  ],
+  "callTemplates": [
+    {
+      "header": "Payment arrangement follow up",
+      "summary": "Agent verifies caller identity, confirms balance, and aligns on a deferred payment plan.",
+      "sentiment": "positive",
+      "tags": ["payment", "follow-up"]
+    },
+    {
+      "header": "Escalated FDCPA concern",
+      "summary": "Caller disputes repeated attempts, agent apologizes and provides compliance disclosure.",
+      "sentiment": "neutral",
+      "tags": ["fdcpa", "compliance"]
+    },
+    {
+      "header": "Promise to pay setup",
+      "summary": "Customer negotiates a split payment and agent outlines schedule and disclosures.",
+      "sentiment": "positive",
+      "tags": ["promise-to-pay"]
+    },
+    {
+      "header": "Supervisor requested",
+      "summary": "Call transferred to supervisor after heated tone, risk flags recorded.",
+      "sentiment": "negative",
+      "tags": ["escalation"]
+    }
+  ],
+  "riskFlags": [
+    {
+      "code": "fdcpa-3",
+      "label": "Mini-Miranda omitted",
+      "severity": "med"
+    },
+    {
+      "code": "tone-2",
+      "label": "Raised voice detected",
+      "severity": "low"
+    },
+    {
+      "code": "promise-1",
+      "label": "Unverified promise to pay",
+      "severity": "med"
+    }
+  ],
+  "transcriptPrompts": [
+    "Thanks for calling Atlas Recoveries, this is {agent}, can I start with your full name?",
+    "Per the FDCPA I need to disclose this is an attempt to collect a debt, and any information will be used for that purpose.",
+    "I can definitely review payment options with you today.",
+    "It looks like we received two payments last month totaling ${amount}.",
+    "Would a bi-weekly plan on Fridays work better?",
+    "I'll email the full outline to the address ending in {emailSuffix}.",
+    "I hear the frustration—let me slow down and walk through the timeline.",
+    "Please avoid sharing banking info aloud if you're not in a private space.",
+    "I'll stay on the line while you review the verification code.",
+    "Is there anything else I can clarify about fees or due dates?"
+  ]
+}

@@ -1,0 +1,82 @@
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: callreview-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: callreview
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', 'localhost/callreview', '--eval', 'db.runCommand({ ping: 1 })']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-express:
+    image: mongo-express:1.0.0-alpha
+    container_name: callreview-mongo-express
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: 'true'
+    ports:
+      - '8081:8081'
+
+  backend:
+    build:
+      context: ../backend
+    container_name: callreview-backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/callreview
+    ports:
+      - '8000:8000'
+    volumes:
+      - ../backend:/app
+    command: python app.py
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8000/api/healthz']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ../frontend
+    container_name: callreview-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file:
+      - ../.env
+    environment:
+      - VITE_API_BASE=http://localhost:8000
+      - VITE_SOCKET_URL=http://localhost:8000
+    ports:
+      - '5173:5173'
+    volumes:
+      - ../frontend:/app
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:5173']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo-data:
