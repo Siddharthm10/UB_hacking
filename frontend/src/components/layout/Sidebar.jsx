@@ -66,13 +66,7 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
 
   const hasCallInRoute = Boolean(callRouteMatch?.params?.callId);
 
-  useEffect(() => {
-    if (!agentId || selectedCallId || !calls.length || hasCallInRoute) return;
-    const firstCallId = calls[0]?.callId;
-    if (!firstCallId) return;
-    setSelectedCallId(firstCallId);
-    navigate(`/a/${agentId}/c/${firstCallId}`, { replace: true });
-  }, [agentId, calls, hasCallInRoute, navigate, selectedCallId, setSelectedCallId]);
+  // Wait for explicit selection; do not auto-pick first call
 
   useEffect(() => {
     setHighlightIndex(0);
@@ -105,8 +99,6 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
 
   const handleLogoClick = () => {
     setSelectedCallId(null);
-    setAgentId('');
-    setInput('');
     navigate('/', { replace: true });
     setMobileVisible(false);
   };
