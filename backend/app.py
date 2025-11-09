@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import textwrap
 import threading
 import time
@@ -55,6 +56,7 @@ def _audio_buffer_factory():
 
 
 SESSION_AUDIO_BUFFER: Dict[str, Dict] = defaultdict(_audio_buffer_factory)
+SESSION_AUDIO_LAST_ACTIVITY: Dict[str, float] = {}
 SESSION_SOCKET_MAP: Dict[str, str] = {}
 SOCKET_SESSION_MAP: Dict[str, str] = {}
 SESSION_METADATA: Dict[str, Dict] = {}
@@ -68,6 +70,7 @@ if os.path.exists(SYSTEM_PROMPT_PATH):
 
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", "300"))
 AUDIO_FLUSH_MIN_BYTES = int(os.environ.get("STT_FLUSH_MIN_BYTES", "48000"))
+AUDIO_SILENCE_FLUSH_SECONDS = float(os.environ.get("STT_SILENCE_SECONDS", "1.0"))
 
 
 class GeminiLiveSessionManager:
@@ -210,13 +213,17 @@ def fetch_customer(customer_id):
     doc = db.customers.find_one({"_id": customer_id})
     if not doc:
         return None
-    return {
+    account_number = doc.get("account_number")
+    payload = {
         "id": str(doc["_id"]),
         "name": doc.get("name"),
-        "account_number": doc.get("account_number"),
+        "account_number": account_number,
+        "accountId": account_number,
         "phone": doc.get("phone"),
+        "segment": doc.get("segment"),
         "assigned_agent_id": str(doc.get("assigned_agent_id")) if doc.get("assigned_agent_id") else None,
     }
+    return payload
 
 
 def serialize_agent_doc(doc):
@@ -229,13 +236,330 @@ def serialize_agent_doc(doc):
 
 
 def serialize_customer_doc(doc):
+    account_number = doc.get("account_number")
     return {
         "id": str(doc["_id"]),
         "name": doc.get("name"),
-        "account_number": doc.get("account_number"),
+        "account_number": account_number,
+        "accountId": account_number,
         "phone": doc.get("phone"),
+        "segment": doc.get("segment"),
         "assigned_agent_id": str(doc.get("assigned_agent_id")) if doc.get("assigned_agent_id") else None,
     }
+
+
+def _agent_payload(doc):
+    if not doc:
+        return None
+    return {
+        "id": doc.get("id") or str(doc.get("_id")),
+        "name": doc.get("name"),
+        "email": doc.get("email"),
+        "team": doc.get("team"),
+    }
+
+
+def _customer_payload(doc):
+    if not doc:
+        return None
+    account_number = doc.get("accountId") or doc.get("account_number")
+    return {
+        "id": doc.get("id") or str(doc.get("_id")),
+        "name": doc.get("name"),
+        "phone": doc.get("phone"),
+        "account_number": account_number,
+        "accountId": account_number,
+        "segment": doc.get("segment"),
+    }
+
+
+def _duration_seconds(start, end=None):
+    if not start:
+        return 0
+    if isinstance(start, str):
+        start = parse_datetime(start)
+    if not end:
+        end = datetime.utcnow()
+    if isinstance(end, str):
+        end = parse_datetime(end)
+    try:
+        delta = end - start
+        return max(0, int(delta.total_seconds()))
+    except Exception:
+        return 0
+
+
+def _session_transcript(session_id: str, session_doc: Dict) -> List[Dict]:
+    return (
+        session_doc.get("transcript")
+        or SESSION_TRANSCRIPTS.get(session_id)
+        or []
+    )
+
+
+def _session_warnings(session_id: str, session_doc: Dict) -> List[Dict]:
+    return session_doc.get("warnings") or SESSION_WARNINGS.get(session_id) or []
+
+
+def _session_snapshot(session_doc: Dict) -> Dict:
+    session_id = session_doc.get("session_id")
+    agent = _agent_payload(fetch_agent(session_doc.get("agent_id")))
+    customer = _customer_payload(fetch_customer(session_doc.get("customer_id")))
+    return {
+        "callId": session_id,
+        "status": session_doc.get("status", "in_progress"),
+        "agent": agent,
+        "customer": customer,
+        "startedAt": _serialize_datetime(session_doc.get("started_at")),
+        "durationSeconds": _duration_seconds(session_doc.get("started_at")),
+        "transcript": _session_transcript(session_id, session_doc),
+        "warnings": _session_warnings(session_id, session_doc),
+    }
+
+
+def _call_record_snapshot(call_doc: Dict) -> Dict:
+    agent = _agent_payload(fetch_agent(call_doc.get("agent_id")))
+    customer = _customer_payload(fetch_customer(call_doc.get("customer_id")))
+    return {
+        "callId": str(call_doc.get("_id")),
+        "status": "completed",
+        "agent": agent,
+        "customer": customer,
+        "startedAt": _serialize_datetime(call_doc.get("start_time")),
+        "durationSeconds": _duration_seconds(call_doc.get("start_time"), call_doc.get("end_time")),
+        "transcript": call_doc.get("full_transcript") or [],
+        "warnings": call_doc.get("violations") or [],
+        "summary": call_doc.get("summary"),
+        "complianceScore": call_doc.get("compliance_score"),
+    }
+
+
+def get_current_call_snapshot() -> Dict:
+    session_doc = db.call_sessions.find_one(
+        {"status": "in_progress"},
+        sort=[("updated_at", -1)],
+    )
+    if session_doc:
+        return _session_snapshot(session_doc)
+
+    latest_call = db.call_records.find_one(sort=[("end_time", -1)])
+    if latest_call:
+        return _call_record_snapshot(latest_call)
+
+    return {"status": "idle", "transcript": []}
+
+
+def _initialize_session_state(session_token: str, agent_object_id, customer_object_id, insertion_id):
+    SESSION_METADATA[session_token] = {
+        "agent_id": agent_object_id,
+        "customer_id": customer_object_id,
+        "call_session_db_id": insertion_id,
+    }
+    SESSION_TRANSCRIPTS[session_token] = []
+    SESSION_WARNINGS[session_token] = []
+    SESSION_CONTEXT[session_token] = deque(maxlen=12)
+    SESSION_AUDIO_BUFFER[session_token] = _audio_buffer_factory()
+    SESSION_ACTIVITY[session_token] = datetime.utcnow()
+
+
+def _create_call_session(agent_id: str, customer_id: str) -> Dict:
+    if not agent_id or not customer_id:
+        raise ValueError("agent_id and customer_id are required")
+    try:
+        agent_object_id = ObjectId(agent_id)
+        customer_object_id = ObjectId(customer_id)
+    except Exception as exc:
+        raise ValueError("Invalid identifiers") from exc
+
+    if not db.agents.find_one({"_id": agent_object_id}):
+        raise LookupError("Agent not found")
+    if not db.customers.find_one({"_id": customer_object_id}):
+        raise LookupError("Customer not found")
+
+    session_token = uuid4().hex
+    call_session = {
+        "session_id": session_token,
+        "agent_id": agent_object_id,
+        "customer_id": customer_object_id,
+        "started_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "status": "in_progress",
+        "transcript": [],
+        "warnings": [],
+    }
+    insertion = db.call_sessions.insert_one(call_session)
+    _initialize_session_state(session_token, agent_object_id, customer_object_id, insertion.inserted_id)
+    call_session["_id"] = insertion.inserted_id
+    return call_session
+
+
+def _finalize_call_session(session_id: str) -> Dict:
+    if not session_id:
+        raise ValueError("session_id is required")
+    call_session = db.call_sessions.find_one({"session_id": session_id})
+    if not call_session:
+        raise LookupError("Session not found")
+
+    final_text = flush_audio_buffer(session_id)
+    if final_text:
+        final_entry = {
+            "speaker": SESSION_LAST_SPEAKER.get(session_id, "agent"),
+            "text": final_text,
+            "at": datetime.utcnow().isoformat()
+        }
+        SESSION_TRANSCRIPTS[session_id].append(final_entry)
+        call_session.setdefault("transcript", []).append(final_entry)
+        db.call_sessions.update_one(
+            {"session_id": session_id},
+            {"$push": {"transcript": final_entry}}
+        )
+
+    agent_object_id = call_session.get("agent_id")
+    customer_object_id = call_session.get("customer_id")
+    full_transcript = call_session.get("transcript") or SESSION_TRANSCRIPTS.get(session_id, [])
+    violations = call_session.get("warnings") or SESSION_WARNINGS.get(session_id, [])
+    if not violations:
+        violations = analyze_transcript(full_transcript)
+    enriched = enriched_summary(full_transcript, violations)
+
+    call_record = {
+        "agent_id": agent_object_id,
+        "customer_id": customer_object_id,
+        "start_time": call_session.get('started_at'),
+        "end_time": datetime.utcnow(),
+        "full_transcript_colored": call_session.get('transcript') or full_transcript,
+        "full_transcript": full_transcript,
+        "summary": enriched["summary_text"],
+        "key_topics": enriched["key_topics"],
+        "compliance_score": enriched["compliance_score"],
+        "violations": violations,
+        "created_at": datetime.utcnow(),
+        "system_prompt": SYSTEM_PROMPT,
+        "session_id": session_id,
+    }
+    result = db.call_records.insert_one(call_record)
+    call_record["_id"] = result.inserted_id
+
+    db.call_sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$set": {
+                "status": "completed",
+                "ended_at": datetime.utcnow(),
+                "call_record_id": result.inserted_id,
+            }
+        }
+    )
+
+    SESSION_TRANSCRIPTS.pop(session_id, None)
+    SESSION_WARNINGS.pop(session_id, None)
+    SESSION_METADATA.pop(session_id, None)
+    SESSION_CONTEXT.pop(session_id, None)
+    SESSION_AUDIO_BUFFER.pop(session_id, None)
+    SESSION_AUDIO_LAST_ACTIVITY.pop(session_id, None)
+    SESSION_ACTIVITY.pop(session_id, None)
+    SESSION_LAST_SPEAKER.pop(session_id, None)
+    socket_id = SESSION_SOCKET_MAP.pop(session_id, None)
+    if socket_id:
+        SOCKET_SESSION_MAP.pop(socket_id, None)
+        socketio.emit('session_status', {"session_id": session_id, "status": "completed", "call_id": str(result.inserted_id)}, room=socket_id)
+
+    return {
+        "call_id": str(result.inserted_id),
+        "analysis": enriched,
+        "call_record": call_record,
+    }
+
+
+def _build_transcript_from_text(raw_text: str) -> List[Dict]:
+    if not raw_text:
+        return []
+    lines = [line.strip() for line in re.split(r"\n+|(?<=[.!?])\s+", raw_text) if line.strip()]
+    if not lines:
+        return []
+    speakers = ["agent", "customer"]
+    transcript = []
+    for idx, line in enumerate(lines):
+        transcript.append(
+            {
+                "speaker": speakers[idx % len(speakers)],
+                "text": line,
+                "at": datetime.utcnow().isoformat(),
+            }
+        )
+    return transcript
+
+
+def _analyze_transcript_with_gemini(session_id: str, transcript: List[Dict]) -> List[Dict]:
+    findings: List[Dict] = []
+    history: List[Dict] = []
+    for segment in transcript:
+        speaker = segment.get("speaker") or "agent"
+        text = segment.get("text") or ""
+        if not text:
+            continue
+        history.append({"speaker": speaker, "text": text})
+        kb_matches = retrieve_relevant_chunks(text, top_k=5)
+        result = gemini_manager.analyze(session_id, speaker, text, history[-5:], kb_matches)
+        if result:
+            timestamp = segment.get("at") or datetime.utcnow().isoformat()
+            for item in result:
+                item.setdefault("rule", "FDCPA")
+                item.setdefault("level", "WARNING")
+                item["timestamp"] = timestamp
+            findings.extend(result)
+    return findings
+
+
+def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes, mime_type: str | None) -> Dict:
+    if not audio_bytes:
+        raise ValueError("Recording payload is empty.")
+    if not agent_id or not customer_id:
+        raise ValueError("agentId and customerId are required.")
+    try:
+        agent_object_id = ObjectId(agent_id)
+        customer_object_id = ObjectId(customer_id)
+    except Exception as exc:
+        raise ValueError("Invalid agent or customer identifier.") from exc
+
+    if not db.agents.find_one({"_id": agent_object_id}):
+        raise LookupError("Agent not found.")
+    if not db.customers.find_one({"_id": customer_object_id}):
+        raise LookupError("Customer not found.")
+
+    transcript_text = transcribe_audio_bytes(audio_bytes, mime_type)
+    if not transcript_text:
+        raise ValueError("Unable to transcribe the recording.")
+
+    transcript = _build_transcript_from_text(transcript_text)
+    if not transcript:
+        raise ValueError("Transcription returned no text segments.")
+
+    session_token = f"upload_{uuid4().hex}"
+    findings = _analyze_transcript_with_gemini(session_token, transcript)
+    if not findings:
+        findings = analyze_transcript(transcript)
+    enriched = enriched_summary(transcript, findings)
+
+    now = datetime.utcnow()
+    call_record = {
+        "agent_id": agent_object_id,
+        "customer_id": customer_object_id,
+        "start_time": now,
+        "end_time": now,
+        "full_transcript_colored": transcript,
+        "full_transcript": transcript,
+        "summary": enriched["summary_text"],
+        "key_topics": enriched["key_topics"],
+        "compliance_score": enriched["compliance_score"],
+        "violations": findings,
+        "created_at": now,
+        "system_prompt": SYSTEM_PROMPT,
+        "session_id": session_token,
+    }
+    result = db.call_records.insert_one(call_record)
+    call_record["_id"] = result.inserted_id
+    return {"call_record": call_record, "analysis": enriched}
 
 
 def parse_gemini_output(raw_text: str) -> List[Dict]:
@@ -275,12 +599,22 @@ def append_audio_chunk(session_id: str, audio_base64: str, mime_type: str, force
     if not audio_bytes:
         return ""
     buffer = SESSION_AUDIO_BUFFER[session_id]
+    now_ts = time.time()
+    flush_segments: List[str] = []
+    last_ts = SESSION_AUDIO_LAST_ACTIVITY.get(session_id)
+    if buffer["data"] and last_ts and (now_ts - last_ts) >= AUDIO_SILENCE_FLUSH_SECONDS:
+        chunk = flush_audio_buffer(session_id)
+        if chunk:
+            flush_segments.append(chunk)
     if buffer["mime_type"] is None:
         buffer["mime_type"] = mime_type or "audio/webm"
     buffer["data"].extend(audio_bytes)
+    SESSION_AUDIO_LAST_ACTIVITY[session_id] = now_ts
     if force_flush or len(buffer["data"]) >= AUDIO_FLUSH_MIN_BYTES:
-        return flush_audio_buffer(session_id)
-    return ""
+        chunk = flush_audio_buffer(session_id)
+        if chunk:
+            flush_segments.append(chunk)
+    return " ".join(flush_segments).strip()
 
 
 def flush_audio_buffer(session_id: str) -> str:
@@ -329,6 +663,7 @@ def cleanup_stale_sessions():
             SESSION_WARNINGS.pop(session_id, None)
             SESSION_CONTEXT.pop(session_id, None)
             SESSION_AUDIO_BUFFER.pop(session_id, None)
+            SESSION_AUDIO_LAST_ACTIVITY.pop(session_id, None)
             SESSION_LAST_SPEAKER.pop(session_id, None)
             SESSION_METADATA.pop(session_id, None)
             socket_id = SESSION_SOCKET_MAP.pop(session_id, None)
@@ -427,13 +762,11 @@ def handle_stream_audio(audio_chunk):
     speaker = payload.get("speaker") or "agent"
     audio_b64 = payload.get("audio_base64")
     mime_type = payload.get("mime_type") or "audio/webm"
-    manual_text = (payload.get("text") or "").strip()
-
     SESSION_LAST_SPEAKER[session_id] = speaker
     SESSION_ACTIVITY[session_id] = datetime.utcnow()
 
-    text = manual_text
-    if not text and audio_b64:
+    text = None
+    if audio_b64:
         text = append_audio_chunk(session_id, audio_b64, mime_type, force_flush=payload.get("is_final", False))
     if not text:
         return
@@ -479,6 +812,60 @@ def get_directory():
     return {"agents": agents, "customers": customers}
 
 
+@app.route("/api/directory")
+def get_directory_alias():
+    return get_directory()
+
+
+@app.route("/api/call/current")
+def api_call_current():
+    return get_current_call_snapshot()
+
+
+@app.route("/api/call/start", methods=['POST'])
+def api_call_start():
+    data = request.get_json() or {}
+    agent_id = data.get("agentId") or data.get("agent_id")
+    customer_id = data.get("customerId") or data.get("customer_id")
+    try:
+        session_doc = _create_call_session(agent_id, customer_id)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except LookupError as exc:
+        return {"error": str(exc)}, 404
+    snapshot = _session_snapshot(session_doc)
+    return {"sessionId": session_doc["session_id"], "call": snapshot}, 201
+
+
+@app.route("/api/call/stop", methods=['POST'])
+def api_call_stop():
+    data = request.get_json() or {}
+    session_id = data.get("sessionId") or data.get("session_id")
+    try:
+        result = _finalize_call_session(session_id)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except LookupError as exc:
+        return {"error": str(exc)}, 404
+    snapshot = _call_record_snapshot(result["call_record"])
+    return {"callId": result["call_id"], "call": snapshot, "analysis": result["analysis"]}
+
+
+@app.route("/api/call/upload", methods=['POST'])
+def api_call_upload():
+    file = request.files.get("recording")
+    if file is None or file.filename == "":
+        return {"error": "recording file is required"}, 400
+    agent_id = request.form.get("agentId") or request.form.get("agent_id")
+    customer_id = request.form.get("customerId") or request.form.get("customer_id")
+    try:
+        payload = _process_uploaded_audio(agent_id, customer_id, file.read(), file.mimetype)
+    except (ValueError, LookupError) as exc:
+        return {"error": str(exc)}, 400
+    snapshot = _call_record_snapshot(payload["call_record"])
+    return {"callId": snapshot["callId"], "call": snapshot, "analysis": payload["analysis"]}, 201
+
+
 @app.route("/kb/sources")
 def kb_sources():
     limit = int(request.args.get("limit", 100))
@@ -513,43 +900,13 @@ def start_session():
     data = request.get_json() or {}
     agent_id = data.get("agent_id")
     customer_id = data.get("customer_id")
-    if not agent_id or not customer_id:
-        return {"error": "agent_id and customer_id are required"}, 400
-
     try:
-        agent_object_id = ObjectId(agent_id)
-        customer_object_id = ObjectId(customer_id)
-    except Exception:
-        return {"error": "Invalid identifiers"}, 400
-
-    if not db.agents.find_one({"_id": agent_object_id}):
-        return {"error": "Agent not found"}, 404
-    if not db.customers.find_one({"_id": customer_object_id}):
-        return {"error": "Customer not found"}, 404
-
-    session_token = uuid4().hex
-    call_session = {
-        "session_id": session_token,
-        "agent_id": agent_object_id,
-        "customer_id": customer_object_id,
-        "started_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-        "status": "in_progress",
-        "transcript": [],
-        "warnings": [],
-    }
-    insertion = db.call_sessions.insert_one(call_session)
-    SESSION_METADATA[session_token] = {
-        "agent_id": agent_object_id,
-        "customer_id": customer_object_id,
-        "call_session_db_id": insertion.inserted_id,
-    }
-    SESSION_TRANSCRIPTS[session_token] = []
-    SESSION_WARNINGS[session_token] = []
-    SESSION_CONTEXT[session_token] = deque(maxlen=12)
-    SESSION_AUDIO_BUFFER[session_token] = _audio_buffer_factory()
-    SESSION_ACTIVITY[session_token] = datetime.utcnow()
-    return {"session_id": session_token}
+        session_doc = _create_call_session(agent_id, customer_id)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except LookupError as exc:
+        return {"error": str(exc)}, 404
+    return {"session_id": session_doc["session_id"]}
 
 
 @app.route("/call/<call_id>", methods=['GET'])
@@ -566,73 +923,13 @@ def end_call():
     session_id = data.get('session_id')
     if not session_id:
         return {"error": "session_id is required"}, 400
-
-    call_session = db.call_sessions.find_one({"session_id": session_id})
-    if not call_session:
-        return {"error": "Session not found"}, 404
-
-    final_text = flush_audio_buffer(session_id)
-    if final_text:
-        final_entry = {
-            "speaker": SESSION_LAST_SPEAKER.get(session_id, "agent"),
-            "text": final_text,
-            "at": datetime.utcnow().isoformat()
-        }
-        SESSION_TRANSCRIPTS[session_id].append(final_entry)
-        call_session.setdefault("transcript", []).append(final_entry)
-        db.call_sessions.update_one(
-            {"session_id": session_id},
-            {"$push": {"transcript": final_entry}}
-        )
-
-    agent_object_id = call_session.get("agent_id")
-    customer_object_id = call_session.get("customer_id")
-    full_transcript = call_session.get("transcript") or SESSION_TRANSCRIPTS.get(session_id, [])
-    violations = call_session.get("warnings") or SESSION_WARNINGS.get(session_id, [])
-    if not violations:
-        violations = analyze_transcript(full_transcript)
-    enriched = enriched_summary(full_transcript, violations)
-
-    call_record = {
-        "agent_id": agent_object_id,
-        "customer_id": customer_object_id,
-        "start_time": call_session.get('started_at') or parse_datetime(data.get('start_time')),
-        "end_time": datetime.utcnow(),
-        "full_transcript_colored": call_session.get('transcript') or full_transcript,
-        "full_transcript": full_transcript,
-        "summary": enriched["summary_text"],
-        "key_topics": enriched["key_topics"],
-        "compliance_score": enriched["compliance_score"],
-        "violations": violations,
-        "created_at": datetime.utcnow(),
-        "system_prompt": SYSTEM_PROMPT,
-        "session_id": session_id,
-    }
-    result = db.call_records.insert_one(call_record)
-    db.call_sessions.update_one(
-        {"session_id": session_id},
-        {
-            "$set": {
-                "status": "completed",
-                "ended_at": datetime.utcnow(),
-                "call_record_id": result.inserted_id,
-            }
-        }
-    )
-
-    SESSION_TRANSCRIPTS.pop(session_id, None)
-    SESSION_WARNINGS.pop(session_id, None)
-    SESSION_METADATA.pop(session_id, None)
-    SESSION_CONTEXT.pop(session_id, None)
-    SESSION_AUDIO_BUFFER.pop(session_id, None)
-    SESSION_ACTIVITY.pop(session_id, None)
-    SESSION_LAST_SPEAKER.pop(session_id, None)
-    socket_id = SESSION_SOCKET_MAP.pop(session_id, None)
-    if socket_id:
-        SOCKET_SESSION_MAP.pop(socket_id, None)
-        socketio.emit('session_status', {"session_id": session_id, "status": "completed", "call_id": str(result.inserted_id)}, room=socket_id)
-
-    return {"call_id": str(result.inserted_id), "analysis": enriched}
+    try:
+        result = _finalize_call_session(session_id)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except LookupError as exc:
+        return {"error": str(exc)}, 404
+    return {"call_id": result["call_id"], "analysis": result["analysis"]}
 
 
 @app.route("/call/<call_id>/pdf")

@@ -42,9 +42,9 @@ def seed_static_data():
         agent_ids = list(db.agents.find({}, {"_id": 1}))
         if agent_ids:
             customers = [
-                {"name": "Jordan Blake", "account_number": "ACCT-001", "phone": "+1-555-0100"},
-                {"name": "Quinn Hart", "account_number": "ACCT-002", "phone": "+1-555-0101"},
-                {"name": "Sasha Lin", "account_number": "ACCT-003", "phone": "+1-555-0102"},
+                {"name": "Jordan Blake", "account_number": "ACCT-001", "phone": "+1-555-0100", "segment": "Premium"},
+                {"name": "Quinn Hart", "account_number": "ACCT-002", "phone": "+1-555-0101", "segment": "Standard"},
+                {"name": "Sasha Lin", "account_number": "ACCT-003", "phone": "+1-555-0102", "segment": "At-Risk"},
             ]
             for index, customer in enumerate(customers):
                 customer["assigned_agent_id"] = agent_ids[index % len(agent_ids)]["_id"]
