@@ -12,6 +12,11 @@ import { TokenStream } from './TokenStream';
 import { LoadingDots } from './LoadingDots';
 import { cn } from '@/lib/utils';
 
+const isDevEnv =
+  typeof import.meta !== 'undefined' && import.meta.env && typeof import.meta.env.DEV !== 'undefined'
+    ? import.meta.env.DEV
+    : false;
+
 const schema = z.object({
   question: z.string().min(3, 'Ask a complete question.').max(500)
 });
@@ -30,11 +35,19 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
   const messagesViewportRef = useRef(null);
   const previousCallIdRef = useRef(null);
   const activeCallIdRef = useRef(null);
+  const streamHasContentRef = useRef(false);
 
   const { register, handleSubmit, reset, formState, setValue } = useForm({
     resolver: zodResolver(schema),
     defaultValues: { question: '' }
   });
+
+  const logAiEvent = (...args) => {
+    if (isDevEnv) {
+      // eslint-disable-next-line no-console
+      console.debug('[AI]', ...args);
+    }
+  };
 
   useEffect(() => {
     const socket = getAiSocket();
@@ -50,21 +63,19 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
       const targetCallId = activeCallIdRef.current;
       if (!targetCallId) return;
       receivedSocketToken.current = true;
+      streamHasContentRef.current = true;
+      logAiEvent('socket token', payload.token);
       updateAiMessage(targetCallId, currentStreamId.current, (msg) => ({
         content: `${msg.content || ''}${payload.token || ''}`
       }));
     }
     function handleDone() {
       const targetCallId = activeCallIdRef.current;
-      if (currentStreamId.current && targetCallId) {
-        updateAiMessage(targetCallId, currentStreamId.current, { streaming: false });
-        currentStreamId.current = null;
-        setStatus('idle');
-      }
-      activeCallIdRef.current = null;
+      finalizeStream(targetCallId);
     }
     function handleError(payload) {
       setError(payload?.message || 'AI service unavailable.');
+      logAiEvent('socket error', payload);
       const targetCallId = activeCallIdRef.current || selectedCallId;
       if (pendingQuestion.current && targetCallId) {
         fallbackToHttp(pendingQuestion.current, targetCallId);
@@ -105,6 +116,7 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
     pendingQuestion.current = '';
     setStatus('idle');
     setError(null);
+    streamHasContentRef.current = false;
     setIsOpen(conversation.length > 0);
     activeCallIdRef.current = null;
     previousCallIdRef.current = selectedCallId;
@@ -123,28 +135,57 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
   }, [scrollSignature, isOpen]);
 
   const fallbackToHttp = (question, callId) => {
+    logAiEvent('http fallback engaged', { callId });
     abortRef.current = streamAiAnswer({
       callId,
       question,
       onToken: (token) => {
         if (!currentStreamId.current) return;
+        streamHasContentRef.current = true;
+        logAiEvent('http token', token);
         updateAiMessage(callId, currentStreamId.current, (msg) => ({
           content: `${msg.content || ''}${token || ''}`
         }));
       },
       onDone: () => {
-        if (currentStreamId.current) {
-          updateAiMessage(callId, currentStreamId.current, { streaming: false });
-          currentStreamId.current = null;
-        }
-        setStatus('idle');
-        activeCallIdRef.current = null;
+        finalizeStream(callId);
       },
       onError: (err) => {
         setError(err?.message || 'Unable to stream AI response.');
-        setStatus('idle');
+        finalizeStream(callId, { hadError: true });
       }
     });
+  };
+
+  const finalizeStream = (callId, { hadError = false } = {}) => {
+    if (!currentStreamId.current || !callId) {
+      return;
+    }
+    const streamId = currentStreamId.current;
+    const hadContent = streamHasContentRef.current;
+    const missingResponseMessage = hadError
+      ? 'AI helper could not reach the language model. Please try again.'
+      : 'AI helper did not return a response. Please try again.';
+
+    updateAiMessage(callId, streamId, (msg) => {
+      const hasExistingContent = Boolean((msg.content || '').trim().length);
+      if (hadContent || hasExistingContent) {
+        return { streaming: false };
+      }
+      return {
+        streaming: false,
+        content: missingResponseMessage
+      };
+    });
+
+    if (!hadContent) {
+      setError(missingResponseMessage);
+    }
+    logAiEvent('stream complete', { callId, hadContent, hadError });
+    currentStreamId.current = null;
+    activeCallIdRef.current = null;
+    streamHasContentRef.current = false;
+    setStatus('idle');
   };
 
   const onSubmit = (values) => {
@@ -160,16 +201,20 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
     currentStreamId.current = streamId;
     activeCallIdRef.current = selectedCallId;
     setStatus('streaming');
+    streamHasContentRef.current = false;
     reset();
     if (socketRef.current?.connected) {
       receivedSocketToken.current = false;
+      logAiEvent('socket emit', { callId: selectedCallId, question: values.question });
       socketRef.current.emit('ai_question', { callId: selectedCallId, question: values.question });
       setTimeout(() => {
         if (!receivedSocketToken.current) {
+          logAiEvent('socket idle fallback -> http', { callId: selectedCallId });
           fallbackToHttp(values.question, selectedCallId);
         }
       }, 1200);
     } else {
+      logAiEvent('socket unavailable -> http fallback', { callId: selectedCallId });
       fallbackToHttp(values.question, selectedCallId);
     }
   };
@@ -250,8 +295,8 @@ export function AiChatBox({ isDisabled = false, className = '' }) {
       >
         {showEmptyState ? (
           <div className="rounded-2xl border border-dashed border-slate-800/80 p-6 text-sm text-slate-400">
-            Ask the AI to summarize the call, highlight compliance risks, or extract action items. It will
-            respond here with answers once the LLM is wired up.
+            Ask the AI to summarize the call, highlight compliance risks, or extract action items. Responses
+            stream in real time with context from the selected call.
           </div>
         ) : (
           conversation.map((message) =>

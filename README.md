@@ -47,8 +47,21 @@ Visit http://localhost:5173 for the UI (backend on http://localhost:8000, Mongo 
 
 - Flask blueprints for agents, calls, AI, and dev seed endpoints.
 - Mongo indexes ensured at boot; Pydantic request validation; SSE + Socket.IO streaming responses.
-- Provider-agnostic LLM interface with guardrails and environment toggles (`LLM_PROVIDER`, `OPENAI_API_KEY`).
+- Provider-agnostic LLM interface with guardrails and environment toggles (`LLM_PROVIDER`, `OPENROUTER_*`).
 - Health/version routes plus automated seed endpoint (`/api/dev/seed`) gated by `ALLOW_DEV_SEED`.
+
+## LLM Provider Configuration
+
+1. Create an API key at [OpenRouter](https://openrouter.ai/keys).
+2. Set the following variables in `.env` (see `.env.example` for defaults):
+   - `LLM_PROVIDER=openrouter`
+   - `OPENROUTER_API_KEY=...`
+   - Optional: `OPENROUTER_MODEL`, `OPENROUTER_APP_NAME`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`.
+3. Restart the backend. The AI chat box will now stream live responses grounded on the active call
+   header, telemetry, and transcript snippets. FDCPA knowledge base chunks are commented out for now
+   and can be toggled once retrieval is ready.
+4. Set `LOG_LEVEL=DEBUG` during development if you want to inspect the exact context payloads and the
+   streaming chunks emitted by the LLM client (logs appear in the backend terminal).
 
 ## Testing
 

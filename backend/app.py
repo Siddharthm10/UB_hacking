@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -6,6 +7,23 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 load_dotenv()
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+
+def configure_logging():
+    """Configure root logging using LOG_LEVEL env var so downstream modules can emit debug data."""
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+        force=True
+    )
+    logging.getLogger('engineio').setLevel(level)
+    logging.getLogger('socketio').setLevel(level)
+
+
+configure_logging()
 
 FRONTEND_ORIGIN = os.getenv('FRONTEND_ORIGIN', 'http://localhost:5173')
 SOCKET_ASYNC_MODE = os.getenv('SOCKET_ASYNC_MODE', 'threading')
