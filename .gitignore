@@ -1,0 +1,23 @@
+# root node_modules (if any)
+node_modules/
+
+# frontend
+my-dashboard/node_modules/
+my-dashboard/dist/
+my-dashboard/.env
+my-dashboard/.vite/
+
+# backend
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+backend/.env
+
+# logs
+*.log
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
