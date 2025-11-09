@@ -24,6 +24,13 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from compliance import analyze_segment, analyze_transcript, enriched_summary
+from kb_service import (
+    ingest_sources,
+    list_sources,
+    refresh_embeddings_on_startup,
+    retrieve_relevant_chunks,
+    search_chunks,
+)
 
 load_dotenv()
 
@@ -40,7 +47,7 @@ ELEVENLABS_STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL_ID", "scribe_v1")
 
 SESSION_TRANSCRIPTS = defaultdict(list)
 SESSION_WARNINGS = defaultdict(list)
-SESSION_CONTEXT = defaultdict(lambda: deque(maxlen=12))
+SESSION_CONTEXT = defaultdict(lambda: deque(maxlen=20))
 
 
 def _audio_buffer_factory():
@@ -76,21 +83,19 @@ class GeminiLiveSessionManager:
         except Exception:
             self.model = None
 
-    def analyze(self, session_id: str, speaker: str, text: str) -> List[Dict]:
+    def analyze(self, session_id: str, speaker: str, text: str, history: List[Dict], kb_matches: List[Dict]) -> List[Dict]:
         if not text:
             return []
         if not self.model:
             return analyze_segment({"speaker": speaker, "text": text})
 
-        context_lines = list(SESSION_CONTEXT.get(session_id, []))
-        context_text = "\n".join(f"{item['speaker'].upper()}: {item['text']}" for item in context_lines[-8:])
-        prompt = self._build_prompt(speaker, text, context_text)
+        prompt = self._build_prompt(speaker, text, history, kb_matches)
         try:
             response = self.model.generate_content(
                 [{"role": "user", "parts": [{"text": prompt}]}],
                 generation_config={
                     "response_mime_type": "application/json",
-                    "temperature": 0.2,
+                    "temperature": 0.1,
                 },
             )
             raw_text = getattr(response, "text", "") or self._collect_parts(response)
@@ -114,15 +119,27 @@ class GeminiLiveSessionManager:
             return ""
 
     @staticmethod
-    def _build_prompt(speaker: str, utterance: str, context: str) -> str:
-        return (
-            "Respond ONLY with a JSON array (can be empty). Schema per entry:\n"
+    def _build_prompt(speaker: str, utterance: str, history: List[Dict], kb_matches: List[Dict]) -> str:
+        recent_dialogue = history[-5:] if history else []
+        dialogue_block = "\n".join(f"{item.get('speaker','Unknown').upper()}: {item.get('text','')}" for item in recent_dialogue)
+        kb_block = "\n---\n".join(
+            f"Source: {match.get('title') or match.get('url')}\nExcerpt: {match.get('text_md', '')}"
+            for match in kb_matches[:5]
+        ) or "No additional references."
+        instructions = (
+            "You are EthiCo, an AI compliance monitor. Determine if the agent's latest action violates FDCPA or signals customer distress.\n"
+            "Respond ONLY with a JSON array. Each object must match:\n"
             '{"type":"VIOLATION|SENTIMENT","level":"CRITICAL|WARNING|DISTRESS",'
             '"rule":"","text":"","suggestion_agent":""}\n'
-            f"Conversation so far:\n{context or '[no previous context]'}\n\n"
-            f"Latest speaker: {speaker}\n"
-            f"Latest utterance: {utterance}\n"
-            "If no violations or distress are detected return an empty array []."
+            "If no issues exist return []."
+        )
+        return (
+            f"{instructions}\n\n"
+            f"Recent conversation:\n{dialogue_block or '[no prior context]'}\n\n"
+            f"Reference knowledge base excerpts:\n{kb_block}\n\n"
+            f"Current speaker: {speaker.upper()}\n"
+            f"Current message: {utterance}\n"
+            "Analyze using the references and conversation context."
         )
 
 
@@ -436,7 +453,9 @@ def handle_stream_audio(audio_chunk):
     target_sid = SESSION_SOCKET_MAP.get(session_id, request.sid)
     socketio.emit('update_transcript', entry, room=target_sid)
 
-    findings = gemini_manager.analyze(session_id, speaker, text)
+    history_snapshot = list(SESSION_CONTEXT[session_id])
+    kb_matches = retrieve_relevant_chunks(text, top_k=5)
+    findings = gemini_manager.analyze(session_id, speaker, text, history_snapshot, kb_matches)
     if findings:
         for item in findings:
             item.setdefault("rule", "FDCPA")
@@ -458,6 +477,35 @@ def get_directory():
     agents = [serialize_agent_doc(doc) for doc in db.agents.find()]
     customers = [serialize_customer_doc(doc) for doc in db.customers.find()]
     return {"agents": agents, "customers": customers}
+
+
+@app.route("/kb/sources")
+def kb_sources():
+    limit = int(request.args.get("limit", 100))
+    sources = list_sources(limit=limit)
+    return {"sources": sources}
+
+
+@app.route("/kb/ingest", methods=['POST'])
+def kb_ingest():
+    body = request.get_json() or {}
+    try:
+        payload = ingest_sources(body)
+        return payload
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"error": str(exc)}, 500
+
+
+@app.route("/kb/search", methods=['POST'])
+def kb_search():
+    body = request.get_json() or {}
+    try:
+        hits = search_chunks(body)
+        return {"hits": hits}
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
 
 
 @app.route("/sessions/start", methods=['POST'])
@@ -780,3 +828,4 @@ def add_agent():
 
 if __name__ == '__main__':
     socketio.run(app, debug=True)
+refresh_embeddings_on_startup()
