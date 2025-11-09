@@ -614,6 +614,96 @@ def _build_transcript_from_text(raw_text: str) -> List[Dict]:
     return transcript
 
 
+def _finalize_transcript_session(session_doc: Dict, transcript: List[Dict], source: str) -> Dict:
+    session_token = session_doc.get("session_id")
+    if not session_token:
+        raise ValueError("Session identifier missing.")
+    agent_object_id = session_doc.get("agent_id")
+    customer_object_id = session_doc.get("customer_id")
+    if not agent_object_id or not customer_object_id:
+        raise ValueError("Session missing participant identifiers.")
+
+    findings, classification = _classify_transcript_with_rules(transcript, session_token)
+    enriched = enriched_summary(transcript, findings, classification)
+    now = datetime.utcnow()
+    call_record = {
+        "agent_id": agent_object_id,
+        "customer_id": customer_object_id,
+        "start_time": session_doc.get("started_at") or now,
+        "end_time": now,
+        "full_transcript_colored": transcript,
+        "full_transcript": transcript,
+        "summary": enriched["summary_text"],
+        "key_topics": enriched["key_topics"],
+        "compliance_score": enriched["compliance_score"],
+        "violations": findings,
+        "call_classification": classification,
+        "created_at": now,
+        "system_prompt": SYSTEM_PROMPT,
+        "session_id": session_token,
+    }
+    result = db.call_records.insert_one(call_record)
+    call_record["_id"] = result.inserted_id
+
+    db.call_sessions.update_one(
+        {"session_id": session_token},
+        {
+            "$set": {
+                "transcript": transcript,
+                "warnings": findings,
+                "summary": enriched["summary_text"],
+                "compliance_score": enriched["compliance_score"],
+                "call_classification": classification,
+                "status": "completed",
+                "started_at": session_doc.get("started_at") or now,
+                "ended_at": now,
+                "updated_at": now,
+                "call_record_id": result.inserted_id,
+                "source": source,
+            }
+        },
+    )
+
+    _clear_session_state(session_token)
+    return {"call_record": call_record, "analysis": enriched, "session_id": session_token}
+
+
+def _apply_transcript_to_session(session_doc: Dict, transcript: List[Dict], source: str = "simulation") -> Dict:
+    session_token = session_doc.get("session_id")
+    if not session_token:
+        raise ValueError("Session identifier missing.")
+    now = datetime.utcnow()
+    SESSION_TRANSCRIPTS[session_token] = list(transcript)
+    SESSION_CONTEXT[session_token] = deque(
+        ({"speaker": entry.get("speaker", "agent"), "text": entry.get("text", "")}
+         for entry in transcript[-12:]),
+        maxlen=12,
+    )
+    SESSION_ACTIVITY[session_token] = now
+
+    findings, classification = _classify_transcript_with_rules(transcript, session_token)
+    SESSION_WARNINGS[session_token] = list(findings)
+
+    db.call_sessions.update_one(
+        {"session_id": session_token},
+        {
+            "$set": {
+                "transcript": transcript,
+                "warnings": findings,
+                "call_classification": classification,
+                "updated_at": now,
+                "source": source,
+            }
+        },
+    )
+
+    return {
+        "transcript": transcript,
+        "warnings": findings,
+        "classification": classification,
+    }
+
+
 def _analyze_transcript_with_gemini(session_id: str, transcript: List[Dict]) -> List[Dict]:
     findings: List[Dict] = []
     history: List[Dict] = []
@@ -641,9 +731,6 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
     if not agent_id or not customer_id:
         raise ValueError("agentId and customerId are required.")
     session_doc = _create_call_session(agent_id, customer_id)
-    agent_object_id = session_doc["agent_id"]
-    customer_object_id = session_doc["customer_id"]
-    session_token = session_doc["session_id"]
 
     transcript_text = transcribe_audio_bytes(audio_bytes, mime_type)
     if not transcript_text:
@@ -652,51 +739,8 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
     transcript = _build_transcript_from_text(transcript_text)
     if not transcript:
         raise ValueError("Transcription returned no text segments.")
-
-    findings, classification = _classify_transcript_with_rules(transcript, session_token)
-    enriched = enriched_summary(transcript, findings, classification)
-
-    now = datetime.utcnow()
-    call_record = {
-        "agent_id": agent_object_id,
-        "customer_id": customer_object_id,
-        "start_time": now,
-        "end_time": now,
-        "full_transcript_colored": transcript,
-        "full_transcript": transcript,
-        "summary": enriched["summary_text"],
-        "key_topics": enriched["key_topics"],
-        "compliance_score": enriched["compliance_score"],
-        "violations": findings,
-        "call_classification": classification,
-        "created_at": now,
-        "system_prompt": SYSTEM_PROMPT,
-        "session_id": session_token,
-    }
-    result = db.call_records.insert_one(call_record)
-    call_record["_id"] = result.inserted_id
-
-    db.call_sessions.update_one(
-        {"session_id": session_token},
-        {
-            "$set": {
-                "transcript": transcript,
-                "warnings": findings,
-                "summary": enriched["summary_text"],
-                "compliance_score": enriched["compliance_score"],
-                "call_classification": classification,
-                "status": "completed",
-                "started_at": now,
-                "ended_at": now,
-                "updated_at": now,
-                "call_record_id": result.inserted_id,
-                "source": "upload",
-            }
-        },
-    )
-    _clear_session_state(session_token)
-
-    return {"call_record": call_record, "analysis": enriched, "session_id": session_token}
+    finalized = _finalize_transcript_session(session_doc, transcript, source="upload")
+    return finalized
 
 
 def parse_gemini_output(raw_text: str) -> List[Dict]:
@@ -1175,6 +1219,27 @@ def api_call_upload():
         "call": snapshot,
         "analysis": payload["analysis"],
     }, 201
+
+
+@app.route("/api/call/simulate_text", methods=['POST'])
+@app.route("/api/call/simulate-text", methods=['POST'])
+def api_call_simulate_text():
+    data = request.get_json() or {}
+    session_id = data.get("sessionId") or data.get("session_id")
+    script = data.get("transcript") or data.get("script")
+    if not session_id:
+        return {"error": "sessionId is required."}, 400
+    if not script or not script.strip():
+        return {"error": "transcript is required."}, 400
+    session_doc = db.call_sessions.find_one({"session_id": session_id})
+    if not session_doc:
+        return {"error": "Session not found."}, 404
+    transcript = _build_transcript_from_text(script)
+    if not transcript:
+        return {"error": "Transcript contained no text segments."}, 400
+    payload = _apply_transcript_to_session(session_doc, transcript, source="simulation")
+    payload["sessionId"] = session_id
+    return payload
 
 
 @app.route("/kb/sources")

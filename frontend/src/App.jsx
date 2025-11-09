@@ -54,6 +54,8 @@ export default function App() {
   const [mode, setMode] = useState("live");
   const [uploadFile, setUploadFile] = useState(null);
   const [isProcessingUpload, setIsProcessingUpload] = useState(false);
+  const [isSimulationEnabled, setIsSimulationEnabled] = useState(false);
+  const [simulationScript, setSimulationScript] = useState("");
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     return window.localStorage.getItem(THEME_STORAGE_KEY) || "dark";
@@ -63,6 +65,8 @@ export default function App() {
   const sessionIdRef = useRef("");
   const mediaRecorderRef = useRef(null);
   const mediaStreamRef = useRef(null);
+  const simulationControllerRef = useRef(null);
+  const simulationAnalysisRef = useRef(null);
 
   useEffect(() => {
     document.title = "EthiCo Live";
@@ -201,6 +205,14 @@ export default function App() {
   }, [selectedAgent, selectedCustomer]);
 
   const stopStreaming = useCallback(() => {
+    const controller = simulationControllerRef.current;
+    if (controller) {
+      controller.aborted = true;
+      if (controller.timeout) {
+        clearTimeout(controller.timeout);
+      }
+      simulationControllerRef.current = null;
+    }
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       try {
@@ -289,6 +301,154 @@ export default function App() {
 
   useEffect(() => () => stopStreaming(), [stopStreaming]);
 
+  const finalizeSession = useCallback(
+    async ({ silent = false } = {}) => {
+      if (!sessionIdRef.current) {
+        if (!silent) {
+          setStatusMessage("No active session to stop.");
+        }
+        return false;
+      }
+      if (!silent) {
+        setStatusMessage("Ending call...");
+      }
+      stopStreaming();
+      let success = false;
+      try {
+        const res = await fetch(withBase("/api/call/stop"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: sessionIdRef.current }),
+        });
+        const payload = await res.json();
+        if (!res.ok) {
+          throw new Error(payload.error || "Unable to stop call.");
+        }
+        if (payload.call) {
+          applySnapshot(payload.call);
+        }
+        setSessionId("");
+        sessionIdRef.current = "";
+        setIsCallActive(false);
+        if (!silent) {
+          setStatusMessage("Call completed and saved.");
+        }
+        success = true;
+      } catch (error) {
+        console.error(error);
+        if (!silent) {
+          setStatusMessage(error.message || "Failed to stop call.");
+        }
+      }
+      return success;
+    },
+    [applySnapshot, stopStreaming]
+  );
+
+  const stopCall = useCallback(async () => {
+    if (mode !== "live") {
+      setStatusMessage("Live session not running.");
+      return;
+    }
+    if (!sessionIdRef.current) {
+      setStatusMessage("No active session to stop.");
+      return;
+    }
+    if (isStopping) return;
+    setIsStopping(true);
+    await finalizeSession();
+    setIsStopping(false);
+  }, [mode, isStopping, finalizeSession]);
+
+  const analyzeSimulationScript = useCallback(
+    async (activeSessionId, script) => {
+      try {
+        const res = await fetch(withBase("/api/call/simulate_text"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: activeSessionId, transcript: script }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(payload.error || `Simulation analysis failed (HTTP ${res.status}).`);
+        }
+        setWarnings(payload.warnings || []);
+        return payload;
+      } catch (error) {
+        console.warn("Simulation analysis error", error);
+        setStatusMessage((prev) => prev || error.message || "Simulation analysis failed.");
+        return null;
+      }
+    },
+    []
+  );
+
+  const simulateTranscriptStreaming = useCallback(
+    async (activeSessionId, script) => {
+      const segments = script
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (segments.length === 0) {
+        setStatusMessage("Simulation script is empty.");
+        return;
+      }
+      setMessages([]);
+      setWarnings([]);
+      setStatusMessage("Simulating transcript...");
+      setIsStreaming(true);
+      const baseSpeakers = ["agent", "customer"];
+      let speakerIndex = 0;
+      const controller = { aborted: false, timeout: null };
+      simulationControllerRef.current = controller;
+      try {
+        for (const segment of segments) {
+          if (controller.aborted) break;
+          const speaker = baseSpeakers[speakerIndex % baseSpeakers.length];
+          speakerIndex += 1;
+          const entry = {
+            speaker,
+            text: segment,
+            at: new Date().toISOString(),
+          };
+          setMessages((prev) => [...prev, entry]);
+          if (socketRef.current) {
+            socketRef.current.emit("stream_text", {
+              session_id: activeSessionId,
+              speaker,
+              text: segment,
+            });
+          }
+          await new Promise((resolve) => {
+            controller.timeout = setTimeout(resolve, 1200);
+          });
+        }
+      } finally {
+        if (controller.timeout) {
+          clearTimeout(controller.timeout);
+        }
+        simulationControllerRef.current = null;
+        setIsStreaming(false);
+      }
+      if (controller.aborted) {
+        setStatusMessage("Simulation cancelled.");
+        return;
+      }
+      if (simulationAnalysisRef.current) {
+        try {
+          await simulationAnalysisRef.current;
+        } catch {
+          // already handled in analyzer
+        } finally {
+          simulationAnalysisRef.current = null;
+        }
+      }
+      const success = await finalizeSession({ silent: true });
+      setStatusMessage(success ? "Simulation completed." : "Simulation ended with an error.");
+    },
+    [finalizeSession]
+  );
+
   const startStreaming = useCallback(
     async (activeSessionId) => {
       if (!socketRef.current || isStreaming || !activeSessionId) return;
@@ -331,6 +491,12 @@ export default function App() {
       return;
     }
     if (isStarting || isCallActive) return;
+    const trimmedScript = simulationScript.trim();
+    const shouldSimulate = isSimulationEnabled && trimmedScript.length > 0;
+    if (isSimulationEnabled && !trimmedScript) {
+      setStatusMessage("Add transcript text to simulate.");
+      return;
+    }
     setIsStarting(true);
     setStatusMessage("Starting call session...");
     try {
@@ -356,8 +522,13 @@ export default function App() {
       setSessionId(newSessionId);
       sessionIdRef.current = newSessionId;
       setIsCallActive(true);
-      setStatusMessage("Call in progress. Streaming audio...");
-      await startStreaming(newSessionId);
+      if (shouldSimulate) {
+        simulationAnalysisRef.current = analyzeSimulationScript(newSessionId, trimmedScript);
+        simulateTranscriptStreaming(newSessionId, trimmedScript);
+      } else {
+        setStatusMessage("Call in progress. Streaming audio...");
+        await startStreaming(newSessionId);
+      }
     } catch (error) {
       console.error(error);
       setStatusMessage(error.message || "Unable to start call.");
@@ -377,48 +548,15 @@ export default function App() {
     startStreaming,
     stopStreaming,
     mode,
+    isSimulationEnabled,
+    simulationScript,
+    simulateTranscriptStreaming,
+    analyzeSimulationScript,
   ]);
-
-  const stopCall = useCallback(async () => {
-    if (mode !== "live") {
-      setStatusMessage("Live session not running.");
-      return;
-    }
-    if (!sessionIdRef.current) {
-      setStatusMessage("No active session to stop.");
-      return;
-    }
-    if (isStopping) return;
-    setIsStopping(true);
-    setStatusMessage("Ending call...");
-    stopStreaming();
-    try {
-      const res = await fetch(withBase("/api/call/stop"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: sessionIdRef.current }),
-      });
-      const payload = await res.json();
-      if (!res.ok) {
-        throw new Error(payload.error || "Unable to stop call.");
-      }
-      if (payload.call) {
-        applySnapshot(payload.call);
-      }
-      setSessionId("");
-      sessionIdRef.current = "";
-      setIsCallActive(false);
-      setStatusMessage("Call completed and saved.");
-    } catch (error) {
-      console.error(error);
-      setStatusMessage(error.message || "Failed to stop call.");
-    } finally {
-      setIsStopping(false);
-    }
-  }, [applySnapshot, stopStreaming, isStopping, mode]);
 
   const resetInterface = useCallback((message) => {
     stopStreaming();
+    simulationAnalysisRef.current = null;
     setSessionId("");
     sessionIdRef.current = "";
     setIsCallActive(false);
@@ -556,6 +694,10 @@ export default function App() {
             onUploadFileChange={setUploadFile}
             onProcessUpload={processUpload}
             isProcessingUpload={isProcessingUpload}
+            isSimulationEnabled={isSimulationEnabled}
+            onSimulationToggle={setIsSimulationEnabled}
+            simulationScript={simulationScript}
+            onSimulationScriptChange={setSimulationScript}
           />
         </div>
 
@@ -605,6 +747,10 @@ function ControlPanel({
   onUploadFileChange,
   onProcessUpload,
   isProcessingUpload,
+  isSimulationEnabled,
+  onSimulationToggle,
+  simulationScript,
+  onSimulationScriptChange,
 }) {
   const canStart = Boolean(
     selectedAgent && selectedCustomer && !isCallActive && !isStarting
@@ -673,38 +819,63 @@ function ControlPanel({
 
 
       {mode === "live" ? (
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={onStart}
-            disabled={!canStart}
-            className={`px-4 py-2 rounded-full text-xs font-semibold transition ${
-              canStart
-                ? "bg-emerald-500 text-white shadow-sm shadow-emerald-200"
-                : "bg-emerald-100 text-emerald-500 cursor-not-allowed"
-            }`}
-          >
-            {isStarting ? "Starting..." : isStreaming ? "Streaming..." : "Start"}
-          </button>
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={onStart}
+              disabled={!canStart}
+              className={`px-4 py-2 rounded-full text-xs font-semibold transition ${
+                canStart
+                  ? "bg-emerald-500 text-white shadow-sm shadow-emerald-200"
+                  : "bg-emerald-100 text-emerald-500 cursor-not-allowed"
+              }`}
+            >
+              {isStarting ? "Starting..." : isStreaming ? "Streaming..." : "Start"}
+            </button>
 
-          <button
-            onClick={onStop}
-            disabled={!canStop}
-            className={`px-4 py-2 rounded-full text-xs font-semibold transition ${
-              canStop
-                ? "bg-red-500 text-white shadow-sm shadow-red-200"
-                : "bg-red-100 text-red-500 cursor-not-allowed"
-            }`}
-          >
-            {isStopping ? "Stopping..." : "Stop"}
-          </button>
+            <button
+              onClick={onStop}
+              disabled={!canStop}
+              className={`px-4 py-2 rounded-full text-xs font-semibold transition ${
+                canStop
+                  ? "bg-red-500 text-white shadow-sm shadow-red-200"
+                  : "bg-red-100 text-red-500 cursor-not-allowed"
+              }`}
+            >
+              {isStopping ? "Stopping..." : "Stop"}
+            </button>
 
-          <button
-            type="button"
-            onClick={() => onReset()}
-            className="px-4 py-2 rounded-full text-xs font-semibold border border-gray-300 text-gray-600 bg-white hover:bg-gray-50 transition"
-          >
-            Reset
-          </button>
+            <button
+              type="button"
+              onClick={() => onReset()}
+              className="px-4 py-2 rounded-full text-xs font-semibold border border-gray-300 text-gray-600 bg-white hover:bg-gray-50 transition"
+            >
+              Reset
+            </button>
+          </div>
+
+          <FormField label="Simulation (optional)">
+            <div className="space-y-2">
+              <label className="inline-flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
+                <input
+                  type="checkbox"
+                  className="rounded border-gray-300 dark:border-slate-600"
+                  checked={isSimulationEnabled}
+                  onChange={(e) => onSimulationToggle(e.target.checked)}
+                />
+                <span>Stream pasted transcript instead of microphone audio</span>
+              </label>
+              {isSimulationEnabled && (
+                <textarea
+                  value={simulationScript}
+                  onChange={(e) => onSimulationScriptChange(e.target.value)}
+                  placeholder="Paste transcript text..."
+                  rows={5}
+                  className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-100"
+                />
+              )}
+            </div>
+          </FormField>
         </div>
       ) : (
         <div className="flex flex-row gap-1 items-center">
