@@ -1,76 +1,74 @@
-import React, { useRef, useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import { Bot, User } from "lucide-react";
 
-export default function Transcript({ messages, status, isLive }) {
-  const ref = useRef(null);
+export default function Transcript({ messages }) {
+  const scrollRef = useRef(null);
 
   useEffect(() => {
-    if (ref.current) {
-      ref.current.scrollTop = ref.current.scrollHeight;
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
 
   return (
-    <section className="flex-1 flex flex-col px-6 py-4 gap-4">
-      <div className="flex items-baseline gap-2">
-        <h2 className="text-sm font-semibold text-gray-800">
+    <div className="bg-white rounded-2xl border border-gray-200 shadow-sm flex flex-col h-full">
+      {/* Header */}
+      <div className="px-6 py-4 border-b border-gray-100 flex items-center gap-2">
+        <span className="text-gray-800 font-semibold text-base">
           Live Transcript
-        </h2>
-        <span className="text-[10px] text-gray-400">
-          {isLive ? "Monitoring" : "Paused"}
         </span>
+        <span className="text-xs text-gray-400">Monitoring</span>
       </div>
 
+      {/* Messages */}
       <div
-        ref={ref}
-        className="flex-1 bg-white rounded-xl shadow-sm border border-gray-200 p-4 overflow-y-auto space-y-3"
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto px-6 py-4 space-y-4 bg-gray-50"
       >
         {(!messages || messages.length === 0) && (
-          <p className="text-xs text-gray-400 italic">
-            {isLive
-              ? "Waiting for transcript from EthiCo backend..."
-              : "Monitoring paused. Press Start to resume."}
+          <p className="text-sm text-gray-400 italic">
+            Connecting to live transcript...
           </p>
         )}
 
         {messages.map((m, i) => (
-          <Bubble key={i} speaker={m.speaker} text={m.text} />
+          <TranscriptLine
+            key={i}
+            speaker={m.speaker}
+            text={m.text}
+          />
         ))}
       </div>
-    </section>
+    </div>
   );
 }
 
-function Bubble({ speaker, text }) {
+function TranscriptLine({ speaker, text }) {
   const isAgent = speaker === "agent";
-  const alignClass = isAgent ? "justify-start" : "justify-end";
-  const bubbleClass = isAgent
-    ? "bg-gray-100 text-gray-800 rounded-tl-none"
-    : "bg-blue-600 text-white rounded-br-none";
-  const Icon = isAgent ? Bot : User;
-  const avatarClass = isAgent
-    ? "bg-blue-100 text-blue-700"
-    : "bg-gray-200 text-gray-700";
+
+  const bubbleBase =
+    "max-w-[60%] px-4 py-2.5 rounded-2xl text-sm leading-snug shadow-sm";
+
+  const agentBubble = `${bubbleBase} bg-white text-gray-800 rounded-tl-none border border-gray-200`;
+  const customerBubble = `${bubbleBase} bg-blue-600 text-white rounded-br-none`;
 
   return (
-    <div className={`flex items-end gap-2 ${alignClass}`}>
+    <div
+      className={`flex items-end gap-3 ${
+        isAgent ? "justify-start" : "justify-end"
+      }`}
+    >
       {isAgent && (
-        <div
-          className={`w-7 h-7 rounded-full ${avatarClass} flex items-center justify-center text-xs`}
-        >
-          <Icon size={14} />
+        <div className="w-8 h-8 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center">
+          <Bot size={16} />
         </div>
       )}
-      <div
-        className={`max-w-[75%] px-3 py-2 rounded-xl text-xs leading-snug ${bubbleClass}`}
-      >
-        {text}
-      </div>
+
+      <div className={isAgent ? agentBubble : customerBubble}>{text}</div>
+
       {!isAgent && (
-        <div
-          className={`w-7 h-7 rounded-full ${avatarClass} flex items-center justify-center text-xs`}
-        >
-          <Icon size={14} />
+        <div className="w-8 h-8 rounded-full bg-gray-200 text-gray-700 flex items-center justify-center">
+          <User size={16} />
         </div>
       )}
     </div>
