@@ -527,6 +527,21 @@ def _finalize_call_session(session_id: str) -> Dict:
     if not call_session:
         raise LookupError("Session not found")
 
+    if call_session.get("status") == "completed" and call_session.get("call_record_id"):
+        call_record = db.call_records.find_one({"_id": call_session["call_record_id"]})
+        if not call_record:
+            raise LookupError("Call record not found for completed session.")
+        enriched = enriched_summary(
+            call_record.get("full_transcript") or [],
+            call_record.get("violations") or [],
+            call_record.get("call_classification", "UNKNOWN"),
+        )
+        return {
+            "call_id": str(call_record["_id"]),
+            "analysis": enriched,
+            "call_record": call_record,
+        }
+
     final_text = flush_audio_buffer(session_id)
     if final_text:
         final_entry = {
@@ -667,41 +682,6 @@ def _finalize_transcript_session(session_doc: Dict, transcript: List[Dict], sour
     _clear_session_state(session_token)
     return {"call_record": call_record, "analysis": enriched, "session_id": session_token}
 
-
-def _apply_transcript_to_session(session_doc: Dict, transcript: List[Dict], source: str = "simulation") -> Dict:
-    session_token = session_doc.get("session_id")
-    if not session_token:
-        raise ValueError("Session identifier missing.")
-    now = datetime.utcnow()
-    SESSION_TRANSCRIPTS[session_token] = list(transcript)
-    SESSION_CONTEXT[session_token] = deque(
-        ({"speaker": entry.get("speaker", "agent"), "text": entry.get("text", "")}
-         for entry in transcript[-12:]),
-        maxlen=12,
-    )
-    SESSION_ACTIVITY[session_token] = now
-
-    findings, classification = _classify_transcript_with_rules(transcript, session_token)
-    SESSION_WARNINGS[session_token] = list(findings)
-
-    db.call_sessions.update_one(
-        {"session_id": session_token},
-        {
-            "$set": {
-                "transcript": transcript,
-                "warnings": findings,
-                "call_classification": classification,
-                "updated_at": now,
-                "source": source,
-            }
-        },
-    )
-
-    return {
-        "transcript": transcript,
-        "warnings": findings,
-        "classification": classification,
-    }
 
 
 def _analyze_transcript_with_gemini(session_id: str, transcript: List[Dict]) -> List[Dict]:
@@ -1237,9 +1217,13 @@ def api_call_simulate_text():
     transcript = _build_transcript_from_text(script)
     if not transcript:
         return {"error": "Transcript contained no text segments."}, 400
-    payload = _apply_transcript_to_session(session_doc, transcript, source="simulation")
-    payload["sessionId"] = session_id
-    return payload
+    finalized = _finalize_transcript_session(session_doc, transcript, source="simulation")
+    snapshot = _call_record_snapshot(finalized["call_record"])
+    return {
+        "sessionId": finalized.get("session_id") or session_id,
+        "call": snapshot,
+        "analysis": finalized.get("analysis"),
+    }
 
 
 @app.route("/kb/sources")

@@ -213,6 +213,7 @@ export default function App() {
       }
       simulationControllerRef.current = null;
     }
+    simulationAnalysisRef.current = null;
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       try {
@@ -372,7 +373,15 @@ export default function App() {
         if (!res.ok) {
           throw new Error(payload.error || `Simulation analysis failed (HTTP ${res.status}).`);
         }
-        setWarnings(payload.warnings || []);
+        if (payload.call) {
+          applySnapshot(payload.call);
+          setWarnings(payload.call.warnings || []);
+        }
+        if (payload.sessionId && sessionIdRef.current === payload.sessionId) {
+          setSessionId("");
+          sessionIdRef.current = "";
+          setIsCallActive(false);
+        }
         return payload;
       } catch (error) {
         console.warn("Simulation analysis error", error);
@@ -380,7 +389,7 @@ export default function App() {
         return null;
       }
     },
-    []
+    [applySnapshot]
   );
 
   const simulateTranscriptStreaming = useCallback(
@@ -430,21 +439,21 @@ export default function App() {
         simulationControllerRef.current = null;
         setIsStreaming(false);
       }
+      let analysisSucceeded = false;
       if (controller.aborted) {
         setStatusMessage("Simulation cancelled.");
-        return;
-      }
-      if (simulationAnalysisRef.current) {
+      } else if (simulationAnalysisRef.current) {
         try {
-          await simulationAnalysisRef.current;
-        } catch {
-          // already handled in analyzer
+          const result = await simulationAnalysisRef.current;
+          analysisSucceeded = Boolean(result && result.call);
         } finally {
           simulationAnalysisRef.current = null;
         }
+        setStatusMessage(analysisSucceeded ? "Simulation completed." : "Simulation ended.");
       }
-      const success = await finalizeSession({ silent: true });
-      setStatusMessage(success ? "Simulation completed." : "Simulation ended with an error.");
+      if (!analysisSucceeded) {
+        await finalizeSession({ silent: true });
+      }
     },
     [finalizeSession]
   );
