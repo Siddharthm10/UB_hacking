@@ -1,14 +1,17 @@
 import base64
 import io
 import json
+import math
 import os
 import re
+import struct
 import textwrap
 import threading
 import time
+import wave
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import google.generativeai as genai
@@ -39,12 +42,67 @@ from models import db
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ], cors_credentials=False, async_mode="eventlet")
+
+
+@app.before_request
+def handle_cors_preflight():
+    if request.method == "OPTIONS":
+        response = make_response("", 204)
+        return response
+
+
+@app.after_request
+def ensure_cors_headers(response):
+    origin = request.headers.get("Origin")
+    # response.headers["Access-Control-Allow-Origin"] = origin or "*"
+    # response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Credentials"] = "false"
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else: 
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = request.headers.get(
+        "Access-Control-Request-Headers", "Authorization, Content-Type"
+    )
+    if origin:
+        vary = response.headers.get("Vary")
+        response.headers["Vary"] = "Origin" if not vary else f"{vary}, Origin"
+    return response
 
 # --- Gemini and ElevenLabs API Configuration ---
 genai.configure(api_key=os.environ.get("GOOGLE_GEMINI_API_KEY"))
 elevenlabs_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
 ELEVENLABS_STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL_ID", "scribe_v1")
+KB_SUMMARY_TTL_SECONDS = int(os.environ.get("KB_SUMMARY_TTL_SECONDS", "900"))
+KB_SUMMARY_BATCH_SIZE = int(os.environ.get("KB_SUMMARY_BATCH_SIZE", "8"))
+KB_RULES_SUMMARY_CACHE = {"text": "", "timestamp": 0.0}
+GEMINI_RULES_MODEL_NAME = os.environ.get("GEMINI_RULES_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-1.5-flash")
+GEMINI_COMPLIANCE_MODEL_NAME = os.environ.get("GEMINI_COMPLIANCE_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-1.5-flash")
+
+try:
+    gemini_rules_model = genai.GenerativeModel(
+        GEMINI_RULES_MODEL_NAME,
+        system_instruction="You condense FDCPA and debt-collection regulations into concise, actionable checklists.",
+    )
+except Exception:
+    gemini_rules_model = None
+
+try:
+    gemini_compliance_model = genai.GenerativeModel(
+        GEMINI_COMPLIANCE_MODEL_NAME,
+        system_instruction=(
+            "You are EthiCo, an FDCPA compliance auditor. "
+            "Review complete transcripts using knowledge-base summaries to determine if violations occurred. "
+            "Always respond with JSON."
+        ),
+    )
+except Exception:
+    gemini_compliance_model = None
 
 SESSION_TRANSCRIPTS = defaultdict(list)
 SESSION_WARNINGS = defaultdict(list)
@@ -179,6 +237,7 @@ def serialize_call(document):
         "key_topics": document.get("key_topics", []),
         "compliance_score": document.get("compliance_score"),
         "violations": document.get("violations", []),
+        "call_classification": document.get("call_classification") or "UNKNOWN",
         "full_transcript": full_transcript,
         "full_transcript_colored": document.get("full_transcript_colored") or full_transcript,
         "agent": agent,
@@ -433,6 +492,7 @@ def _finalize_call_session(session_id: str) -> Dict:
         "key_topics": enriched["key_topics"],
         "compliance_score": enriched["compliance_score"],
         "violations": violations,
+        "call_classification": enriched.get("call_classification", "UNKNOWN"),
         "created_at": datetime.utcnow(),
         "system_prompt": SYSTEM_PROMPT,
         "session_id": session_id,
@@ -536,10 +596,8 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
         raise ValueError("Transcription returned no text segments.")
 
     session_token = f"upload_{uuid4().hex}"
-    findings = _analyze_transcript_with_gemini(session_token, transcript)
-    if not findings:
-        findings = analyze_transcript(transcript)
-    enriched = enriched_summary(transcript, findings)
+    findings, classification = _classify_transcript_with_rules(transcript, session_token)
+    enriched = enriched_summary(transcript, findings, classification)
 
     now = datetime.utcnow()
     call_record = {
@@ -553,6 +611,7 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
         "key_topics": enriched["key_topics"],
         "compliance_score": enriched["compliance_score"],
         "violations": findings,
+        "call_classification": classification,
         "created_at": now,
         "system_prompt": SYSTEM_PROMPT,
         "session_id": session_token,
@@ -583,6 +642,169 @@ def parse_gemini_output(raw_text: str) -> List[Dict]:
             except json.JSONDecodeError:
                 return []
     return []
+
+
+def _chunk_list(items: List[str], size: int):
+    step = max(1, size)
+    for idx in range(0, len(items), step):
+        yield items[idx: idx + step]
+
+
+def _summarize_rules_block(block_text: str) -> str:
+    clean = (block_text or "").strip()
+    if not clean:
+        return ""
+    if not gemini_rules_model:
+        return textwrap.shorten(clean, width=2000, placeholder=" ...")
+    prompt = (
+        "Summarize the following debt-collection regulations into concise bullet points. "
+        "Highlight prohibited actions, disclosure requirements, cadence limits, and escalation rules.\n\n"
+        f"{clean}"
+    )
+    try:
+        response = gemini_rules_model.generate_content(
+            [{"role": "user", "parts": [{"text": prompt}]}],
+            generation_config={"temperature": 0.2, "max_output_tokens": 512},
+        )
+        text = getattr(response, "text", "") or ""
+        if text.strip():
+            return text.strip()
+        candidates = getattr(response, "candidates", [])
+        if candidates:
+            parts = candidates[0].content.parts
+            values = [getattr(part, "text", "") for part in parts if getattr(part, "text", "")]
+            if values:
+                return "\n".join(values).strip()
+    except Exception as exc:
+        print(f"[kb_rules_summary] Gemini error: {exc}")
+    return textwrap.shorten(clean, width=2000, placeholder=" ...")
+
+
+def _build_kb_rules_summary(force_refresh: bool = False) -> str:
+    now = time.time()
+    cached_text = KB_RULES_SUMMARY_CACHE.get("text") or ""
+    cached_ts = KB_RULES_SUMMARY_CACHE.get("timestamp") or 0.0
+    if not force_refresh and cached_text and (now - cached_ts) < KB_SUMMARY_TTL_SECONDS:
+        return cached_text
+
+    cursor = db.kb_chunks.find({}, {"text_md": 1, "title": 1, "url": 1})
+    working: List[str] = []
+    batch: List[str] = []
+    for doc in cursor:
+        chunk_text = (doc.get("text_md") or "").strip()
+        if not chunk_text:
+            continue
+        label = doc.get("title") or doc.get("url") or "Reference"
+        batch.append(f"{label}:\n{chunk_text}")
+        if len(batch) >= KB_SUMMARY_BATCH_SIZE:
+            working.append(_summarize_rules_block("\n\n".join(batch)))
+            batch = []
+    if batch:
+        working.append(_summarize_rules_block("\n\n".join(batch)))
+
+    if not working:
+        summary = FDCPA_RULES_TEXT.strip()
+    else:
+        stage = working
+        while len(stage) > 1:
+            next_stage: List[str] = []
+            for group in _chunk_list(stage, KB_SUMMARY_BATCH_SIZE):
+                next_stage.append(_summarize_rules_block("\n\n".join(group)))
+            stage = [item for item in next_stage if item.strip()]
+            if not stage:
+                break
+        summary = stage[0] if stage else FDCPA_RULES_TEXT.strip()
+
+    KB_RULES_SUMMARY_CACHE["text"] = summary
+    KB_RULES_SUMMARY_CACHE["timestamp"] = now
+    return summary
+
+
+def _parse_compliance_report(payload: str) -> Tuple[List[Dict], str]:
+    if not payload:
+        return [], "UNKNOWN"
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return [], "UNKNOWN"
+
+    classification = "UNKNOWN"
+    violations: List[Dict] = []
+    if isinstance(data, dict):
+        classification = (data.get("call_classification") or "UNKNOWN").upper()
+        raw = data.get("violations")
+        if isinstance(raw, list):
+            violations = raw
+    elif isinstance(data, list):
+        violations = data
+        classification = "VIOLATION" if violations else "NO_VIOLATION"
+
+    if classification not in {"VIOLATION", "NO_VIOLATION"}:
+        classification = "UNKNOWN"
+    return violations, classification
+
+
+def _classify_transcript_with_rules(transcript: List[Dict], session_label: str) -> Tuple[List[Dict], str]:
+    if not transcript:
+        return [], "UNKNOWN"
+    kb_summary = _build_kb_rules_summary()
+    dialogue = "\n".join(
+        f"{(segment.get('speaker') or 'agent').upper()}: {segment.get('text', '').strip()}"
+        for segment in transcript
+        if (segment.get("text") or "").strip()
+    )
+    if not dialogue:
+        return [], "UNKNOWN"
+
+    instructions = (
+        "You are EthiCo, an FDCPA compliance auditor. Review the entire transcript and decide if the call "
+        "contains any FDCPA violations or notable customer distress.\n"
+        "Respond ONLY with JSON using this schema:\n"
+        '{'
+        '"call_classification":"VIOLATION|NO_VIOLATION",'
+        '"violations":['
+        '{"type":"VIOLATION|SENTIMENT","level":"CRITICAL|WARNING|DISTRESS","rule":"","text":"","suggestion_agent":""}'
+        ']'
+        '}\n'
+        "If no issues exist, return call_classification \"NO_VIOLATION\" and an empty violations array."
+    )
+    prompt = (
+        f"{instructions}\n\n"
+        f"Compliance rule summary:\n{kb_summary}\n\n"
+        f"Full transcript:\n{dialogue}"
+    )
+
+    if gemini_compliance_model:
+        try:
+            response = gemini_compliance_model.generate_content(
+                [{"role": "user", "parts": [{"text": prompt}]}],
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.15,
+                    "max_output_tokens": 1024,
+                },
+            )
+            raw_text = getattr(response, "text", "") or ""
+            if not raw_text.strip():
+                candidates = getattr(response, "candidates", [])
+                if candidates:
+                    parts = candidates[0].content.parts
+                    values = [getattr(part, "text", "") for part in parts if getattr(part, "text", "")]
+                    raw_text = "\n".join(values)
+            violations, classification = _parse_compliance_report(raw_text)
+            if violations or classification != "UNKNOWN":
+                timestamp = datetime.utcnow().isoformat()
+                for item in violations:
+                    item.setdefault("timestamp", timestamp)
+                    item.setdefault("rule", "FDCPA")
+                    item.setdefault("level", "WARNING")
+                return violations, classification
+        except Exception as exc:
+            print(f"[compliance_classification] session={session_label} error={exc}")
+
+    fallback = analyze_transcript(transcript)
+    classification = "VIOLATION" if fallback else "NO_VIOLATION"
+    return fallback, classification
 
 
 def decode_audio_chunk(audio_base64: str) -> bytes:
@@ -672,8 +894,6 @@ def cleanup_stale_sessions():
                 socketio.emit('session_status', {"session_id": session_id, "status": "abandoned"}, room=socket_id)
 
 
-cleanup_thread = threading.Thread(target=cleanup_stale_sessions, daemon=True)
-cleanup_thread.start()
 
 
 def extract_transcript_text(response) -> str:
@@ -1124,5 +1344,9 @@ def add_agent():
 
 
 if __name__ == '__main__':
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # avoids HF fork warning
     refresh_embeddings_on_startup()
-    socketio.run(app, debug=True)
+    # move the cleanup thread start INSIDE this block
+    cleanup_thread = threading.Thread(target=cleanup_stale_sessions, daemon=True)
+    cleanup_thread.start()
+    socketio.run(app, port=5000, debug=True)

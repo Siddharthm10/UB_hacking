@@ -1,8 +1,11 @@
 import React, { useEffect, useRef } from "react";
 import { Bot, User } from "lucide-react";
 
-export default function Transcript({ messages }) {
+export default function Transcript({ messages, mode }) {
   const scrollRef = useRef(null);
+  const isUploadMode = mode === "upload";
+  const title = isUploadMode ? "Uploaded Transcript" : "Live Transcript";
+  const subtitle = isUploadMode ? "Recording summary" : "Monitoring";
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -11,13 +14,13 @@ export default function Transcript({ messages }) {
   }, [messages]);
 
   return (
-    <div className="bg-white rounded-2xl border border-gray-200 dark:bg-slate-900 dark:border-slate-800 shadow-sm flex flex-col h-full">
+    <div className="bg-white rounded-2xl border border-gray-200 dark:bg-slate-900 dark:border-slate-800 shadow-sm flex flex-col h-[28rem] sm:h-[32rem] overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-gray-100 dark:border-slate-800 flex items-center gap-2">
         <span className="text-gray-800 dark:text-slate-100 font-semibold text-base">
-          Live Transcript
+          {title}
         </span>
-        <span className="text-xs text-gray-400 dark:text-gray-500">Monitoring</span>
+        <span className="text-xs text-gray-400 dark:text-gray-500">{subtitle}</span>
       </div>
 
       {/* Messages */}
@@ -27,7 +30,9 @@ export default function Transcript({ messages }) {
       >
         {(!messages || messages.length === 0) && (
           <p className="text-sm text-gray-400 dark:text-gray-500 italic">
-            Connecting to live transcript...
+            {isUploadMode
+              ? "Upload a recording to view its transcript."
+              : "Connecting to live transcript..."}
           </p>
         )}
 

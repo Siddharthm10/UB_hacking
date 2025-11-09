@@ -46,6 +46,10 @@ def refresh_embeddings_on_startup() -> None:
         logger.info("No startup ingest jobs configured; skipping knowledge base refresh.")
         return
 
+    logger.info("Clearing existing KB chunks before startup ingest.")
+    delete_result = KB_COLLECTION.delete_many({})
+    logger.info("Removed %s existing KB chunks.", delete_result.deleted_count)
+
     for job in STARTUP_INGEST_JOBS:
         try:
             logger.info("Running startup ingest for query=%s", job.get("query"))

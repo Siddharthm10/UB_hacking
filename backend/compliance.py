@@ -163,7 +163,11 @@ def compliance_score(violations: Sequence[Dict]) -> int:
     return max(40, 100 - deductions)
 
 
-def enriched_summary(transcript: Sequence[Dict[str, str]], violations: Sequence[Dict]) -> Dict:
+def enriched_summary(
+    transcript: Sequence[Dict[str, str]],
+    violations: Sequence[Dict],
+    call_classification: str = "UNKNOWN",
+) -> Dict:
     topics = summarize_topics(transcript)
     summary_text = generate_summary(transcript)
     return {
@@ -172,4 +176,5 @@ def enriched_summary(transcript: Sequence[Dict[str, str]], violations: Sequence[
         "violations": violations,
         "compliance_score": compliance_score(violations),
         "knowledge_base_snippet": FDCPA_RULES_TEXT.strip(),
+        "call_classification": call_classification,
     }

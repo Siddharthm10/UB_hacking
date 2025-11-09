@@ -219,8 +219,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const socketTarget = API_BASE || undefined;
-    const socket = io(socketTarget, { transports: ["websocket"] });
+    const socketTarget = API_BASE || "http://127.0.0.1:5000";
+    const socket = io(socketTarget, {
+      transports: ["websocket", "polling"],
+      withCredentials: false,
+    });
     socketRef.current = socket;
 
     socket.on("update_transcript", (entry) => {
@@ -562,12 +565,12 @@ export default function App() {
           <StatusBanner message={statusMessage} />
         )}
 
-        <div className="flex-1 px-10 py-6 flex flex-col gap-6 lg:flex-row">
-          <div className="flex-1">
-            <Transcript messages={messages} />
+        <div className="flex-1 px-10 py-6 flex flex-col gap-6 lg:flex-row overflow-hidden min-h-0">
+          <div className="flex-1 min-h-0">
+            <Transcript messages={messages} mode={mode} />
           </div>
 
-          <div className="w-full lg:w-96 flex flex-col gap-6">
+          <div className="w-full lg:w-96 flex flex-col gap-6 min-h-0">
             <WarningsPanel warnings={warnings} />
           </div>
         </div>
