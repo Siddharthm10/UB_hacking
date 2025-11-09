@@ -14,7 +14,7 @@ export default function Transcript({ messages, mode }) {
   }, [messages]);
 
   return (
-    <div className="bg-white rounded-2xl border border-gray-200 dark:bg-slate-900 dark:border-slate-800 shadow-sm flex flex-col h-[28rem] sm:h-[32rem] overflow-hidden">
+    <div className="bg-white rounded-2xl border border-gray-200 dark:bg-slate-900 dark:border-slate-800 shadow-sm flex flex-col h-[22rem] sm:h-[26rem] overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-gray-100 dark:border-slate-800 flex items-center gap-2">
         <span className="text-gray-800 dark:text-slate-100 font-semibold text-base">
