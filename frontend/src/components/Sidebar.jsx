@@ -1,5 +1,6 @@
 import React from "react";
 import { PhoneCall, User, Clock3, AlertTriangle } from "lucide-react";
+import logoImage from "../assets/logo.png";
 
 export default function Sidebar({ call, warnings = [], isCallActive }) {
   const duration = call?.durationSeconds || 0;
@@ -28,9 +29,11 @@ export default function Sidebar({ call, warnings = [], isCallActive }) {
   return (
     <aside className="w-80 bg-white border-r border-gray-200 dark:bg-slate-900 dark:border-slate-800 flex flex-col gap-6 px-6 py-6 text-gray-900 dark:text-slate-100">
       <div className="flex items-center gap-3">
-        <div className="w-9 h-9 rounded-2xl bg-emerald-500 flex items-center justify-center text-white font-semibold text-lg">
-          E
-        </div>
+        <img
+          src={logoImage}
+          alt="EthiCo logo"
+          className="h-10 w-10 rounded-2xl border border-emerald-200 object-cover dark:border-emerald-500/30"
+        />
         <div className="flex flex-col leading-tight">
           <span className="font-semibold text-gray-900 dark:text-white">EthiCo Live</span>
           <span className="text-xs text-gray-500 dark:text-gray-400">Real-time Monitoring</span>

@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 STARTUP_INGEST_JOBS = [
     {"query": "FDCPA full text site:govinfo.gov", "k": 3, "allowedDomains": ["govinfo.gov"], "sourceTags": ["fdcpa","statute"]},
     {"query": "FDCPA summary site:law.cornell.edu", "k": 3, "allowedDomains": ["law.cornell.edu"], "sourceTags": ["fdcpa","summary"]},
-    {"query": "CFPB debt collection rules", "k": 6, "allowedDomains": ["consumerfinance.gov"], "sourceTags": ["cfpb","regulations"]},
-    {"query": "NY debt collection rules DFS", "k": 5, "allowedDomains": ["dfs.ny.gov","nyc.gov"], "sourceTags": ["ny","state"]},
 ]
 
 KB_COLLECTION = db.kb_chunks
