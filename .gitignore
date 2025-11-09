@@ -1,0 +1,6 @@
+.env
+.venv
+.vscode
+__pycache__/
+uvicorn.log
+uvicorn.pid
