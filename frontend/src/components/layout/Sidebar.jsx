@@ -7,6 +7,7 @@ import { useCallStore } from '@/state/useCallStore';
 import { CallListItem } from '@/components/calls/CallListItem';
 import { CommandPalette } from './CommandPalette';
 import { cn } from '@/lib/utils';
+import logo from '@/assets/logo.png';
 
 export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
   const {
@@ -138,10 +139,17 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
 
   const sidebarBody = (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-slate-600">Agent</p>
-          <h1 className="text-lg font-semibold text-slate-100">Call Review</h1>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <img
+            src={logo}
+            alt="EthiCo logo"
+            className="h-10 w-10 rounded-2xl border border-slate-800/70 bg-slate-900/60 object-cover p-1"
+          />
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.4em] text-slate-500">EthiCo</p>
+            <h1 className="text-lg font-semibold text-slate-100">Call Review</h1>
+          </div>
         </div>
         <button
           className="rounded-full border border-slate-700/80 p-2 text-slate-400 hover:text-slate-100"
