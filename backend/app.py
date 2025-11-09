@@ -41,30 +41,55 @@ load_dotenv()
 from models import db
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ], cors_credentials=False, async_mode="eventlet")
+
+
+def _parse_allowed_origins(value: Optional[str]):
+    if not value or value.strip() == "*":
+        return "*"
+    origins = [item.strip() for item in value.split(",") if item.strip()]
+    return origins or "*"
+
+
+HTTP_ALLOWED_ORIGINS = _parse_allowed_origins(
+    os.environ.get(
+        "HTTP_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5173,http://0.0.0.0:5173,http://localhost:5173",
+    )
+)
+CORS(app, resources={r"/*": {"origins": HTTP_ALLOWED_ORIGINS}}, supports_credentials=True)
+
+SOCKETIO_ALLOWED_ORIGINS = _parse_allowed_origins(
+    os.environ.get(
+        "SOCKETIO_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5173,http://0.0.0.0:5173,http://localhost:5173",
+    )
+)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=SOCKETIO_ALLOWED_ORIGINS,
+    cors_credentials=True,
+)
 
 
 @app.before_request
 def handle_cors_preflight():
     if request.method == "OPTIONS":
         response = make_response("", 204)
-        return response
+        return ensure_cors_headers(response)
 
 
 @app.after_request
 def ensure_cors_headers(response):
     origin = request.headers.get("Origin")
-    # response.headers["Access-Control-Allow-Origin"] = origin or "*"
-    # response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Credentials"] = "false"
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-    else: 
-        response.headers["Access-Control-Allow-Origin"] = "*"
+    allowed_origin = "*"
+    if HTTP_ALLOWED_ORIGINS == "*" and not origin:
+        allowed_origin = "*"
+    elif HTTP_ALLOWED_ORIGINS == "*":
+        allowed_origin = origin or "*"
+    elif origin and isinstance(HTTP_ALLOWED_ORIGINS, list) and origin in HTTP_ALLOWED_ORIGINS:
+        allowed_origin = origin
+    response.headers["Access-Control-Allow-Origin"] = allowed_origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = request.headers.get(
         "Access-Control-Request-Headers", "Authorization, Content-Type"
@@ -81,8 +106,8 @@ ELEVENLABS_STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL_ID", "scribe_v1")
 KB_SUMMARY_TTL_SECONDS = int(os.environ.get("KB_SUMMARY_TTL_SECONDS", "900"))
 KB_SUMMARY_BATCH_SIZE = int(os.environ.get("KB_SUMMARY_BATCH_SIZE", "8"))
 KB_RULES_SUMMARY_CACHE = {"text": "", "timestamp": 0.0}
-GEMINI_RULES_MODEL_NAME = os.environ.get("GEMINI_RULES_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-1.5-flash")
-GEMINI_COMPLIANCE_MODEL_NAME = os.environ.get("GEMINI_COMPLIANCE_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-1.5-flash")
+GEMINI_RULES_MODEL_NAME = os.environ.get("GEMINI_RULES_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-2.0-flash-lite")
+GEMINI_COMPLIANCE_MODEL_NAME = os.environ.get("GEMINI_COMPLIANCE_MODEL") or os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-2.0-flash-lite")
 
 try:
     gemini_rules_model = genai.GenerativeModel(
@@ -131,9 +156,21 @@ AUDIO_FLUSH_MIN_BYTES = int(os.environ.get("STT_FLUSH_MIN_BYTES", "48000"))
 AUDIO_SILENCE_FLUSH_SECONDS = float(os.environ.get("STT_SILENCE_SECONDS", "1.0"))
 
 
+def _clear_session_state(session_id: str):
+    SESSION_TRANSCRIPTS.pop(session_id, None)
+    SESSION_WARNINGS.pop(session_id, None)
+    SESSION_METADATA.pop(session_id, None)
+    SESSION_CONTEXT.pop(session_id, None)
+    SESSION_AUDIO_BUFFER.pop(session_id, None)
+    SESSION_AUDIO_LAST_ACTIVITY.pop(session_id, None)
+    SESSION_ACTIVITY.pop(session_id, None)
+    SESSION_LAST_SPEAKER.pop(session_id, None)
+    socket_id = SESSION_SOCKET_MAP.pop(session_id, None)
+    if socket_id:
+        SOCKET_SESSION_MAP.pop(socket_id, None)
 class GeminiLiveSessionManager:
     def __init__(self):
-        self.model_name = os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-1.5-flash")
+        self.model_name = os.environ.get("GEMINI_LIVE_MODEL", "models/gemini-2.0-flash-lite")
         instructions = SYSTEM_PROMPT or "You are EthiCo, an AI compliance monitor."
         instructions = f"{instructions}\n\nApplicable Rules:\n{FDCPA_RULES_TEXT.strip()}"
         try:
@@ -151,6 +188,11 @@ class GeminiLiveSessionManager:
             return analyze_segment({"speaker": speaker, "text": text})
 
         prompt = self._build_prompt(speaker, text, history, kb_matches)
+        print(
+            "[live_prompt] session="
+            f"{session_id or 'live'} speaker={speaker}\n{prompt}\n--- END LIVE PROMPT ---",
+            flush=True,
+        )
         try:
             response = self.model.generate_content(
                 [{"role": "user", "parts": [{"text": prompt}]}],
@@ -160,6 +202,11 @@ class GeminiLiveSessionManager:
                 },
             )
             raw_text = getattr(response, "text", "") or self._collect_parts(response)
+            print(
+                "[live_response] session="
+                f"{session_id or 'live'} speaker={speaker}\n{raw_text}\n--- END LIVE RESPONSE ---",
+                flush=True,
+            )
             parsed = parse_gemini_output(raw_text)
             if parsed:
                 return parsed
@@ -181,26 +228,46 @@ class GeminiLiveSessionManager:
 
     @staticmethod
     def _build_prompt(speaker: str, utterance: str, history: List[Dict], kb_matches: List[Dict]) -> str:
-        recent_dialogue = history[-5:] if history else []
-        dialogue_block = "\n".join(f"{item.get('speaker','Unknown').upper()}: {item.get('text','')}" for item in recent_dialogue)
-        kb_block = "\n---\n".join(
-            f"Source: {match.get('title') or match.get('url')}\nExcerpt: {match.get('text_md', '')}"
-            for match in kb_matches[:5]
-        ) or "No additional references."
-        instructions = (
-            "You are EthiCo, an AI compliance monitor. Determine if the agent's latest action violates FDCPA or signals customer distress.\n"
-            "Respond ONLY with a JSON array. Each object must match:\n"
-            '{"type":"VIOLATION|SENTIMENT","level":"CRITICAL|WARNING|DISTRESS",'
-            '"rule":"","text":"","suggestion_agent":""}\n'
-            "If no issues exist return []."
+        recent_dialogue = history[-6:] if history else []
+        dialogue_block = "\n".join(
+            f"{(item.get('speaker') or 'Unknown').upper()}: {item.get('text','')}" for item in recent_dialogue
         )
+        kb_block = "\n---\n".join(
+            f"Source: {m.get('title') or m.get('url')}\nExcerpt:\n{m.get('text_md','')}"
+            for m in kb_matches[:5]
+        ) or "No additional references."
+
+        schema = (
+            'Return ONLY a JSON array. Each item MUST be:\n'
+            '{'
+            '"type":"VIOLATION"|"SENTIMENT",'
+            '"level":"CRITICAL"|"WARNING"|"DISTRESS",'
+            '"rule":"FDCPA §806|FDCPA §807|FDCPA §808|NYS",'
+            '"text":string,'
+            '"suggestion_agent":string,'
+            '"citation":string  // one of the provided sources (title or URL)'
+            '}'
+        )
+
+        fewshot = (
+            "Examples:\n"
+            '[]\n'
+            '[{"type":"SENTIMENT","level":"DISTRESS","rule":"NYS","text":"[customer crying]","suggestion_agent":"Offer callback and de-escalate.","citation":"NYC DFS guidance"}]\n'
+            '[{"type":"VIOLATION","level":"CRITICAL","rule":"FDCPA §806","text":"collector used profanity","suggestion_agent":"Apologize and stop abusive language immediately.","citation":"FDCPA §806 - govinfo.gov"}]\n'
+        )
+
+        instructions = (
+            "You are EthiCo, an FDCPA compliance monitor. Detect ONLY concrete violations or clear distress. "
+            "Prefer precision over recall; do not speculate. If uncertain, return []. "
+        )
+
         return (
-            f"{instructions}\n\n"
+            f"{instructions}\n{schema}\n{fewshot}\n\n"
             f"Recent conversation:\n{dialogue_block or '[no prior context]'}\n\n"
             f"Reference knowledge base excerpts:\n{kb_block}\n\n"
             f"Current speaker: {speaker.upper()}\n"
             f"Current message: {utterance}\n"
-            "Analyze using the references and conversation context."
+            "Output: JSON only."
         )
 
 
@@ -379,8 +446,9 @@ def _session_snapshot(session_doc: Dict) -> Dict:
 def _call_record_snapshot(call_doc: Dict) -> Dict:
     agent = _agent_payload(fetch_agent(call_doc.get("agent_id")))
     customer = _customer_payload(fetch_customer(call_doc.get("customer_id")))
+    call_identifier = call_doc.get("session_id") or call_doc.get("_id")
     return {
-        "callId": str(call_doc.get("_id")),
+        "callId": str(call_identifier),
         "status": "completed",
         "agent": agent,
         "customer": customer,
@@ -511,18 +579,14 @@ def _finalize_call_session(session_id: str) -> Dict:
         }
     )
 
-    SESSION_TRANSCRIPTS.pop(session_id, None)
-    SESSION_WARNINGS.pop(session_id, None)
-    SESSION_METADATA.pop(session_id, None)
-    SESSION_CONTEXT.pop(session_id, None)
-    SESSION_AUDIO_BUFFER.pop(session_id, None)
-    SESSION_AUDIO_LAST_ACTIVITY.pop(session_id, None)
-    SESSION_ACTIVITY.pop(session_id, None)
-    SESSION_LAST_SPEAKER.pop(session_id, None)
-    socket_id = SESSION_SOCKET_MAP.pop(session_id, None)
+    socket_id = SESSION_SOCKET_MAP.get(session_id)
     if socket_id:
-        SOCKET_SESSION_MAP.pop(socket_id, None)
-        socketio.emit('session_status', {"session_id": session_id, "status": "completed", "call_id": str(result.inserted_id)}, room=socket_id)
+        socketio.emit(
+            'session_status',
+            {"session_id": session_id, "status": "completed", "call_id": str(result.inserted_id)},
+            room=socket_id,
+        )
+    _clear_session_state(session_id)
 
     return {
         "call_id": str(result.inserted_id),
@@ -576,16 +640,10 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
         raise ValueError("Recording payload is empty.")
     if not agent_id or not customer_id:
         raise ValueError("agentId and customerId are required.")
-    try:
-        agent_object_id = ObjectId(agent_id)
-        customer_object_id = ObjectId(customer_id)
-    except Exception as exc:
-        raise ValueError("Invalid agent or customer identifier.") from exc
-
-    if not db.agents.find_one({"_id": agent_object_id}):
-        raise LookupError("Agent not found.")
-    if not db.customers.find_one({"_id": customer_object_id}):
-        raise LookupError("Customer not found.")
+    session_doc = _create_call_session(agent_id, customer_id)
+    agent_object_id = session_doc["agent_id"]
+    customer_object_id = session_doc["customer_id"]
+    session_token = session_doc["session_id"]
 
     transcript_text = transcribe_audio_bytes(audio_bytes, mime_type)
     if not transcript_text:
@@ -595,7 +653,6 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
     if not transcript:
         raise ValueError("Transcription returned no text segments.")
 
-    session_token = f"upload_{uuid4().hex}"
     findings, classification = _classify_transcript_with_rules(transcript, session_token)
     enriched = enriched_summary(transcript, findings, classification)
 
@@ -618,7 +675,28 @@ def _process_uploaded_audio(agent_id: str, customer_id: str, audio_bytes: bytes,
     }
     result = db.call_records.insert_one(call_record)
     call_record["_id"] = result.inserted_id
-    return {"call_record": call_record, "analysis": enriched}
+
+    db.call_sessions.update_one(
+        {"session_id": session_token},
+        {
+            "$set": {
+                "transcript": transcript,
+                "warnings": findings,
+                "summary": enriched["summary_text"],
+                "compliance_score": enriched["compliance_score"],
+                "call_classification": classification,
+                "status": "completed",
+                "started_at": now,
+                "ended_at": now,
+                "updated_at": now,
+                "call_record_id": result.inserted_id,
+                "source": "upload",
+            }
+        },
+    )
+    _clear_session_state(session_token)
+
+    return {"call_record": call_record, "analysis": enriched, "session_id": session_token}
 
 
 def parse_gemini_output(raw_text: str) -> List[Dict]:
@@ -773,6 +851,10 @@ def _classify_transcript_with_rules(transcript: List[Dict], session_label: str) 
         f"Compliance rule summary:\n{kb_summary}\n\n"
         f"Full transcript:\n{dialogue}"
     )
+    print(
+        f"[compliance_prompt] session={session_label}\n{prompt}\n--- END COMPLIANCE PROMPT ---",
+        flush=True,
+    )
 
     if gemini_compliance_model:
         try:
@@ -791,6 +873,10 @@ def _classify_transcript_with_rules(transcript: List[Dict], session_label: str) 
                     parts = candidates[0].content.parts
                     values = [getattr(part, "text", "") for part in parts if getattr(part, "text", "")]
                     raw_text = "\n".join(values)
+            print(
+                f"[compliance_response] session={session_label}\n{raw_text}\n--- END COMPLIANCE RESPONSE ---",
+                flush=True,
+            )
             violations, classification = _parse_compliance_report(raw_text)
             if violations or classification != "UNKNOWN":
                 timestamp = datetime.utcnow().isoformat()
@@ -1083,7 +1169,12 @@ def api_call_upload():
     except (ValueError, LookupError) as exc:
         return {"error": str(exc)}, 400
     snapshot = _call_record_snapshot(payload["call_record"])
-    return {"callId": snapshot["callId"], "call": snapshot, "analysis": payload["analysis"]}, 201
+    return {
+        "callId": snapshot["callId"],
+        "sessionId": payload.get("session_id") or snapshot["callId"],
+        "call": snapshot,
+        "analysis": payload["analysis"],
+    }, 201
 
 
 @app.route("/kb/sources")

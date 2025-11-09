@@ -221,8 +221,6 @@ export default function App() {
   useEffect(() => {
     const socketTarget = API_BASE || "http://127.0.0.1:5000";
     const socket = io(socketTarget, {
-      transports: ["websocket", "polling"],
-      withCredentials: false,
     });
     socketRef.current = socket;
 
@@ -709,8 +707,8 @@ function ControlPanel({
           </button>
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
-          <FormField label="Recording File">
+        <div className="flex flex-row gap-1 items-center">
+          <FormField label="">
             <label className="inline-flex items-center gap-3 cursor-pointer">
               <span className="px-4 py-2 rounded-full bg-gray-900 text-white text-xs font-semibold">
                 Choose File
@@ -722,7 +720,7 @@ function ControlPanel({
                 className="sr-only"
               />
               <span className="text-xs text-gray-500">
-                {uploadFile ? uploadFile.name : "No file selected"}
+                {uploadFile ? uploadFile.name : ""}
               </span>
             </label>
           </FormField>

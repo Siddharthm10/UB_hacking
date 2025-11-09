@@ -15,13 +15,11 @@ load_dotenv()
 from models import db
 
 logger = logging.getLogger(__name__)
-STARTUP_INGEST_JOBS: List[Dict] = [
-    {
-        "query": "latest CFPB debt collection rules",
-        "k": 5,
-        "allowedDomains": ["consumerfinance.gov"],
-        "sourceTags": ["cfpb", "regulations"],
-    }
+STARTUP_INGEST_JOBS = [
+    {"query": "FDCPA full text site:govinfo.gov", "k": 3, "allowedDomains": ["govinfo.gov"], "sourceTags": ["fdcpa","statute"]},
+    {"query": "FDCPA summary site:law.cornell.edu", "k": 3, "allowedDomains": ["law.cornell.edu"], "sourceTags": ["fdcpa","summary"]},
+    {"query": "CFPB debt collection rules", "k": 6, "allowedDomains": ["consumerfinance.gov"], "sourceTags": ["cfpb","regulations"]},
+    {"query": "NY debt collection rules DFS", "k": 5, "allowedDomains": ["dfs.ny.gov","nyc.gov"], "sourceTags": ["ny","state"]},
 ]
 
 KB_COLLECTION = db.kb_chunks
@@ -32,8 +30,8 @@ KB_COLLECTION.create_index("tags", background=True)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 SEARCH_SCAN_LIMIT = int(os.getenv("KB_SEARCH_SCAN_LIMIT", "2000"))
-DEFAULT_CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "2000"))
-DEFAULT_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "300"))
+DEFAULT_CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "1200"))
+DEFAULT_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "180"))
 
 embedder = SentenceTransformer(EMBED_MODEL)
 
