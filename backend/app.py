@@ -827,5 +827,5 @@ def add_agent():
 
 
 if __name__ == '__main__':
+    refresh_embeddings_on_startup()
     socketio.run(app, debug=True)
-refresh_embeddings_on_startup()

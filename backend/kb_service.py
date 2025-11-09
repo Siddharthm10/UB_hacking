@@ -15,6 +15,14 @@ load_dotenv()
 from models import db
 
 logger = logging.getLogger(__name__)
+STARTUP_INGEST_JOBS: List[Dict] = [
+    {
+        "query": "latest CFPB debt collection rules",
+        "k": 5,
+        "allowedDomains": ["consumerfinance.gov"],
+        "sourceTags": ["cfpb", "regulations"],
+    }
+]
 
 KB_COLLECTION = db.kb_chunks
 KB_COLLECTION.create_index("url", background=True)
@@ -30,43 +38,20 @@ DEFAULT_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "300"))
 embedder = SentenceTransformer(EMBED_MODEL)
 
 
-def refresh_embeddings_on_startup(batch_size: int = 32) -> None:
+def refresh_embeddings_on_startup() -> None:
     """
-    Ensure every chunk document has an embedding generated with the current model.
+    Re-run ingestion for configured queries to ensure the KB reflects the latest web content.
     """
-    query = {
-        "$or": [
-            {"embedding": {"$exists": False}},
-            {"embedding": None},
-            {"embedding": []},
-            {"embedding_model": {"$ne": EMBED_MODEL}},
-        ]
-    }
-    cursor = KB_COLLECTION.find(query, {"_id": 1, "text_md": 1})
-    batch = []
-    updated = 0
-    for doc in cursor:
-        if not doc.get("text_md"):
-            continue
-        batch.append(doc)
-        if len(batch) >= batch_size:
-            updated += _update_embeddings_batch(batch)
-            batch = []
-    if batch:
-        updated += _update_embeddings_batch(batch)
-    if updated:
-        logger.info("KB embeddings refreshed for %s chunks using %s", updated, EMBED_MODEL)
+    if not STARTUP_INGEST_JOBS:
+        logger.info("No startup ingest jobs configured; skipping knowledge base refresh.")
+        return
 
-
-def _update_embeddings_batch(batch: List[Dict]) -> int:
-    texts = [doc["text_md"] for doc in batch]
-    vectors = embedder.encode(texts, normalize_embeddings=True).tolist()
-    for doc, vec in zip(batch, vectors):
-        KB_COLLECTION.update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"embedding": vec, "embedding_model": EMBED_MODEL}},
-        )
-    return len(batch)
+    for job in STARTUP_INGEST_JOBS:
+        try:
+            logger.info("Running startup ingest for query=%s", job.get("query"))
+            ingest_sources(job)
+        except Exception as exc:
+            logger.warning("Startup ingest failed for %s: %s", job.get("query"), exc)
 
 
 def pull_clean_text(url: str) -> Optional[str]:
