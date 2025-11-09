@@ -1,4 +1,4 @@
-# EthiCO
+# EthiCo
 
 Premium dark-mode dashboard for reviewing agent call histories, exploring transcripts, and chatting with an AI assistant that is grounded on the active call.
 
