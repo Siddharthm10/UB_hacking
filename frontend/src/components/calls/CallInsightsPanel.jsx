@@ -1,5 +1,5 @@
 import { StatCard } from '@/components/common/StatCard';
-import { Activity, GaugeCircle, MessageSquare, Shield } from 'lucide-react';
+import { Activity, GaugeCircle, Shield } from 'lucide-react';
 
 export function CallInsightsPanel({ call, messages }) {
   if (!call) {
@@ -20,7 +20,6 @@ export function CallInsightsPanel({ call, messages }) {
       <StatCard label="Avg sentiment" value={call.sentiment || 'neutral'} trend="↑ 4%" trendLabel="vs. peers" icon={GaugeCircle} />
       <StatCard label="Risk flags" value={riskCount} trend="Watchlist" icon={Shield} />
       <StatCard label="Talk:Listen" value={talkRatio} icon={Activity} trend={`${talkTurns} / ${listenTurns} turns`} />
-      <StatCard label="Transcript turns" value={messages?.length || 0} icon={MessageSquare} trend="virtualized" />
     </div>
   );
 }

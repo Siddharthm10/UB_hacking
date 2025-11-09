@@ -1,5 +1,4 @@
-import { Link } from 'react-router-dom';
-import { AlertTriangle, Clock3, FileJson, UserCircle2 } from 'lucide-react';
+import { AlertTriangle, Clock3, UserCircle2 } from 'lucide-react';
 import { formatDate, formatDuration, sentimentPill, cn } from '@/lib/utils';
 import { Badge } from '@/components/common/Badge';
 import { Pill } from '@/components/common/Pill';
@@ -23,13 +22,6 @@ export function CallDetails({ call }) {
         {call.sentiment ? (
           <Badge className={cn('capitalize', sentimentPill(call.sentiment))}>{call.sentiment}</Badge>
         ) : null}
-        <Link
-          to="#"
-          className="ml-auto inline-flex items-center gap-2 text-xs text-slate-400 hover:text-slate-100"
-        >
-          <FileJson size={16} />
-          Open raw JSON
-        </Link>
       </div>
       <div className="mt-4 grid grid-cols-2 gap-4 text-sm text-slate-300 md:grid-cols-4">
         <div className="flex items-center gap-2">

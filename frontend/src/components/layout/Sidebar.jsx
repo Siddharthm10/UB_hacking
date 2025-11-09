@@ -103,6 +103,14 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
     setMobileVisible(false);
   };
 
+  const handleLogoClick = () => {
+    setSelectedCallId(null);
+    setAgentId('');
+    setInput('');
+    navigate('/', { replace: true });
+    setMobileVisible(false);
+  };
+
   useEffect(() => {
     function onKey(event) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -140,7 +148,12 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
   const sidebarBody = (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={handleLogoClick}
+          className="flex items-center gap-3 rounded-2xl border border-transparent px-1 py-1 text-left transition hover:border-slate-700 focus:outline-none focus-visible:border-primary/60"
+          aria-label="Go to dashboard home"
+        >
           <img
             src={logo}
             alt="EthiCo logo"
@@ -150,7 +163,7 @@ export function Sidebar({ mobileVisible, setMobileVisible = () => {} }) {
             <p className="text-[10px] uppercase tracking-[0.4em] text-slate-500">EthiCo</p>
             <h1 className="text-lg font-semibold text-slate-100">Call Review</h1>
           </div>
-        </div>
+        </button>
         <button
           className="rounded-full border border-slate-700/80 p-2 text-slate-400 hover:text-slate-100"
           onClick={() => setCommandPaletteOpen(true)}
